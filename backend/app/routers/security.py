@@ -157,6 +157,44 @@ async def bulk_2fa(body: Bulk2faIn, db: AsyncSession = Depends(get_db)):
     return StreamingResponse(bulk_stream(accounts, _change), media_type="application/x-ndjson")
 
 
+async def _terminate_other_authorizations(cli) -> tuple[int, int]:
+    res = await cli(GetAuthorizationsRequest())
+    killed = 0
+    failed = 0
+    for a in res.authorizations:
+        if a.current:
+            continue
+        try:
+            await cli(ResetAuthorizationRequest(hash=a.hash))
+            killed += 1
+        except Exception:
+            failed += 1
+    return killed, failed
+
+
+@router.post("/sessions/terminate_others_all")
+async def terminate_others_all(db: AsyncSession = Depends(get_db)):
+    res = await db.execute(
+        select(Account).where(Account.status != "banned").order_by(Account.id)
+    )
+    accounts = [
+        (a.id, a.phone, (f"{a.first_name or ''} {a.last_name or ''}".strip() or a.phone))
+        for a in res.scalars().all()
+    ]
+
+    async def _terminate(cli, aid):
+        killed, failed = await _terminate_other_authorizations(cli)
+        detail = "no other sessions" if killed == 0 else f"terminated {killed}"
+        if failed:
+            detail += f", {failed} failed"
+        return "ok", detail
+
+    return StreamingResponse(
+        bulk_stream(accounts, _terminate),
+        media_type="application/x-ndjson",
+    )
+
+
 @router.get("/sessions/{account_id}", response_model=list[TgSessionOut])
 async def list_sessions(account_id: int):
     cli = manager.get(account_id)
@@ -196,16 +234,7 @@ async def terminate_others(account_id: int):
     if not cli:
         raise HTTPException(409, "Account not connected")
     try:
-        res = await cli(GetAuthorizationsRequest())
-        killed = 0
-        for a in res.authorizations:
-            if a.current:
-                continue
-            try:
-                await cli(ResetAuthorizationRequest(hash=a.hash))
-                killed += 1
-            except Exception:
-                pass
+        killed, _failed = await _terminate_other_authorizations(cli)
     except Exception as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "terminated": killed}

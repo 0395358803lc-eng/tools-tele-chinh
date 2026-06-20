@@ -113,6 +113,7 @@ export const Endpoints = {
   accounts: () => api.get('/api/accounts'),
   account: (id) => api.get(`/api/accounts/${id}`),
   deleteAccount: (id) => api.del(`/api/accounts/${id}`),
+  removeAllAccounts: (password) => api.post('/api/accounts/remove_all', { password }),
 
   // gone / banned account history
   goneAccounts: () => api.get('/api/gone_accounts'),
@@ -123,6 +124,12 @@ export const Endpoints = {
   signIn: (phone, code) => api.post('/api/auth/sign_in', { phone, code }),
   signIn2fa: (phone, password) => api.post('/api/auth/sign_in_2fa', { phone, code: '', password }),
   authCancel: (phone) => api.post('/api/auth/cancel', { phone }),
+  importSessions: (files) => {
+    const fd = new FormData()
+    for (const f of files) fd.append('files', f)
+    return api.postForm('/api/auth/import_sessions', fd)
+  },
+  syncSessionsFolder: () => api.post('/api/auth/sync_sessions_folder'),
 
   qrStart:    () => api.post('/api/auth/qr/start'),
   qrRecreate: (qr_id) => api.post('/api/auth/qr/recreate', { qr_id }),
@@ -156,6 +163,7 @@ export const Endpoints = {
   tgSessions: (id) => api.get(`/api/security/sessions/${id}`),
   terminateSession: (id, hash) => api.del(`/api/security/sessions/${id}/${hash}`),
   terminateOthers: (id) => api.post(`/api/security/sessions/${id}/terminate_others`),
+  terminateOthersAll: (onEvent) => streamNDJSON('/api/security/sessions/terminate_others_all', {}, onEvent),
 
   // bulk 2FA: how many current passwords we already remember from login, and the
   // streaming change run (tries remembered pw first, then the bank; ≤5 per account)
@@ -190,6 +198,7 @@ export const Endpoints = {
   openChat: (id, input, limit = 40) => api.post(`/api/messaging/${id}/open`, { input, limit }),
   chatHistory: (id, peer, limit = 40) => api.get(`/api/messaging/${id}/history`, { peer, limit }),
   chatSend: (id, peer, text) => api.post(`/api/messaging/${id}/chat_send`, { peer, text }),
+  targetCheck: (target) => api.post('/api/messaging/target_check', { target }),
   // which reactions this post's chat actually allows (standard + custom emoji)
   allowedReactions: (post_link, account_id) => api.post('/api/messaging/allowed_reactions', { post_link, account_id }),
   // reactions: [{ emoji, account_ids, custom_emoji_id? }]

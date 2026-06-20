@@ -31,11 +31,16 @@ const goneName = (g) => `${g.first_name || ''} ${g.last_name || ''}`.trim() || g
 export default function Sidebar({ accounts, gone = [], selectedId, onSelect, onAdd, onDeleted, onGoneChange }) {
   const toast = useToast()
   const [pendingDelete, setPendingDelete] = useState(null)  // account pending removal
+  const [confirmRemoveAll, setConfirmRemoveAll] = useState(false)
+  const [passwordRemoveAll, setPasswordRemoveAll] = useState(false)
+  const [removeAllPassword, setRemoveAllPassword] = useState('')
+  const [removeAllBusy, setRemoveAllBusy] = useState(false)
   const [goneOpen, setGoneOpen] = useState(false)
 
   // Banned accounts drop out of the active list (they live in Gone/Banned).
   // Serial numbers are the 1-based position in this active list.
   const active = accounts.filter((a) => a.status !== 'banned')
+  const totalAccounts = accounts.length
 
   async function confirmDelete() {
     const a = pendingDelete
@@ -46,6 +51,38 @@ export default function Sidebar({ accounts, gone = [], selectedId, onSelect, onA
       toast.success('Account removed')
       onDeleted?.()
     } catch (err) { toast.error(err.message) }
+  }
+
+  function askRemoveAllPassword() {
+    setConfirmRemoveAll(false)
+    setRemoveAllPassword('')
+    setPasswordRemoveAll(true)
+  }
+
+  function closeRemoveAllPassword() {
+    if (removeAllBusy) return
+    setPasswordRemoveAll(false)
+    setRemoveAllPassword('')
+  }
+
+  async function removeAllAccounts() {
+    if (!removeAllPassword) {
+      toast.error('Enter app password')
+      return
+    }
+    setRemoveAllBusy(true)
+    try {
+      const r = await Endpoints.removeAllAccounts(removeAllPassword)
+      toast.success(`Removed ${r.removed || 0} account(s)`)
+      setPasswordRemoveAll(false)
+      setRemoveAllPassword('')
+      onDeleted?.()
+      onSelect?.(null)
+    } catch (err) {
+      toast.error(err.message)
+    } finally {
+      setRemoveAllBusy(false)
+    }
   }
 
   async function clearGone() {
@@ -161,6 +198,13 @@ export default function Sidebar({ accounts, gone = [], selectedId, onSelect, onA
       )}
 
       <div className="p-3 border-t-2 border-black dark:border-white shrink-0">
+        <button
+          className="nb-btn-err w-full mb-2"
+          disabled={totalAccounts === 0 || removeAllBusy}
+          onClick={() => setConfirmRemoveAll(true)}
+        >
+          Remove All Accounts
+        </button>
         <button className="nb-btn-pri w-full" onClick={onAdd}>+ Add Account</button>
       </div>
 
@@ -174,6 +218,45 @@ export default function Sidebar({ accounts, gone = [], selectedId, onSelect, onA
           onConfirm={confirmDelete}
           onCancel={() => setPendingDelete(null)}
         />
+      )}
+
+      {confirmRemoveAll && (
+        <ConfirmModal
+          title="Remove all accounts?"
+          message={`This will remove all ${totalAccounts} account(s), stop their clients, and delete their local session files.\n\nDo you want to continue?`}
+          confirmLabel="Yes"
+          cancelLabel="No"
+          danger
+          onConfirm={askRemoveAllPassword}
+          onCancel={() => setConfirmRemoveAll(false)}
+        />
+      )}
+
+      {passwordRemoveAll && (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={closeRemoveAllPassword}>
+          <div className="nb-card p-6 w-full max-w-sm" onClick={(e) => e.stopPropagation()}>
+            <h2 className="font-extrabold uppercase tracking-tight mb-2">Enter password</h2>
+            <div className="text-sm opacity-80 mb-4">
+              Type the app password from your env file to remove all accounts.
+            </div>
+            <input
+              type="password"
+              className="nb-input mb-4"
+              value={removeAllPassword}
+              onChange={(e) => setRemoveAllPassword(e.target.value)}
+              placeholder="App password"
+              autoFocus
+              onKeyDown={(e) => { if (e.key === 'Enter') removeAllAccounts() }}
+              disabled={removeAllBusy}
+            />
+            <div className="flex gap-2 justify-end">
+              <button className="nb-btn" disabled={removeAllBusy} onClick={closeRemoveAllPassword}>Cancel</button>
+              <button className="nb-btn-err" disabled={removeAllBusy || !removeAllPassword} onClick={removeAllAccounts}>
+                {removeAllBusy ? 'Removing...' : 'Remove All'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </aside>
   )

@@ -25,10 +25,11 @@ from ..models import Account
 from ..schemas import (
     SendMessageIn, BulkMessageIn, ReactIn, ViewPostIn,
     AllowedReactionsIn, AllowedReactionsOut, AllowedCustomReaction,
-    OpenChatIn, ChatSendIn, BulkWipeChatIn,
+    OpenChatIn, ChatSendIn, BulkWipeChatIn, TargetUsageCheckIn,
 )
 from ..tg_manager import manager
 from ..utils import friendly_error, bulk_stream
+from ..config import settings
 
 router = APIRouter(prefix="/api/messaging", tags=["messaging"])
 
@@ -54,6 +55,14 @@ def _parse_post_link(link: str) -> tuple[str, int]:
 
 async def _accounts_named(db: AsyncSession, ids: list[int]) -> list[tuple[int, str, str]]:
     res = await db.execute(select(Account).where(Account.id.in_(ids)))
+    return [
+        (a.id, a.phone, (f"{a.first_name or ''} {a.last_name or ''}".strip() or a.phone))
+        for a in res.scalars().all()
+    ]
+
+
+async def _all_accounts_named(db: AsyncSession) -> list[tuple[int, str, str]]:
+    res = await db.execute(select(Account).where(Account.status != "banned").order_by(Account.id))
     return [
         (a.id, a.phone, (f"{a.first_name or ''} {a.last_name or ''}".strip() or a.phone))
         for a in res.scalars().all()
@@ -347,6 +356,106 @@ async def _history(cli, entity, limit: int = 40) -> list[dict]:
         out.append(_msg_to_dict(m))
     out.reverse()  # oldest-first for natural top-to-bottom display
     return out
+
+
+async def _has_any_message(cli, entity) -> bool:
+    async for _m in cli.iter_messages(entity, limit=1):
+        return True
+    return False
+
+
+async def _has_dialog(cli, entity) -> bool:
+    target_id = getattr(entity, "id", None)
+    target_username = (getattr(entity, "username", None) or "").lower()
+    async for dialog in cli.iter_dialogs():
+        e = dialog.entity
+        if target_id is not None and getattr(e, "id", None) == target_id:
+            return True
+        if target_username and (getattr(e, "username", None) or "").lower() == target_username:
+            return True
+    return False
+
+
+async def _target_usage_for_client(cli, target: str) -> dict:
+    peer_ref, _ = _parse_chat_input(target)
+    entity = await cli.get_entity(_coerce_peer(peer_ref))
+    peer = _peer_info(entity)
+
+    if isinstance(entity, User):
+        has_messages = await _has_any_message(cli, entity)
+        label = "bot" if getattr(entity, "bot", False) else "user"
+        return {
+            "status": "present" if has_messages else "absent",
+            "detail": f"has messages with this {label}" if has_messages else f"no messages with this {label}",
+            "peer": peer,
+        }
+
+    if isinstance(entity, (Channel, Chat)):
+        joined = await _has_dialog(cli, entity)
+        label = peer.get("kind") or "chat"
+        return {
+            "status": "present" if joined else "absent",
+            "detail": f"joined/open in dialogs ({label})" if joined else f"not joined/opened ({label})",
+            "peer": peer,
+        }
+
+    has_messages = await _has_any_message(cli, entity)
+    return {
+        "status": "present" if has_messages else "absent",
+        "detail": "has messages" if has_messages else "no messages found",
+        "peer": peer,
+    }
+
+
+@router.post("/target_check")
+async def target_check(body: TargetUsageCheckIn, db: AsyncSession = Depends(get_db)):
+    target = (body.target or "").strip()
+    if not target:
+        raise HTTPException(400, "Enter a bot, channel, group, or user username")
+    try:
+        _parse_chat_input(target)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    accounts = await _all_accounts_named(db)
+    conc = max(1, int(getattr(settings, "CONCURRENCY", 8) or 8))
+    sem = asyncio.Semaphore(conc)
+    peer: dict | None = None
+
+    async def _one(aid: int, phone: str, name: str):
+        nonlocal peer
+        async with sem:
+            cli = manager.get(aid)
+            if not cli:
+                return {
+                    "id": aid, "phone": phone, "name": name,
+                    "status": "skipped", "detail": "not connected",
+                }
+            try:
+                checked = await _target_usage_for_client(cli, target)
+                if peer is None:
+                    peer = checked.get("peer")
+                return {
+                    "id": aid, "phone": phone, "name": name,
+                    "status": checked["status"], "detail": checked["detail"],
+                }
+            except Exception as e:
+                return {
+                    "id": aid, "phone": phone, "name": name,
+                    "status": "failed", "detail": friendly_error(e),
+                }
+
+    results = await asyncio.gather(*(_one(aid, phone, name) for aid, phone, name in accounts))
+    return {
+        "target": target,
+        "peer": peer,
+        "total": len(results),
+        "present": [r for r in results if r["status"] == "present"],
+        "absent": [r for r in results if r["status"] == "absent"],
+        "skipped": [r for r in results if r["status"] == "skipped"],
+        "failed": [r for r in results if r["status"] == "failed"],
+        "results": results,
+    }
 
 
 @router.post("/{account_id}/open")

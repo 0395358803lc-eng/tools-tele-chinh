@@ -36,6 +36,10 @@ def _verify_password(pw: str) -> bool:
         return False
 
 
+def verify_app_password(pw: str) -> bool:
+    return _verify_password(pw)
+
+
 # --- signer ---
 _signer: Optional[TimestampSigner] = None
 

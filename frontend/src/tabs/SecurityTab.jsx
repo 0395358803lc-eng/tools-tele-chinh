@@ -288,6 +288,49 @@ function Bulk2faPanel({ accounts, onChange }) {
   )
 }
 
+function BulkTerminateSessionsPanel({ accounts, onChange }) {
+  const toast = useToast()
+  const { progress, run, close } = useBulkProgress()
+  const [busy, setBusy] = useState(false)
+  const accountCount = accounts.length
+
+  async function start() {
+    if (accountCount === 0) {
+      toast.error('No accounts available')
+      return
+    }
+    if (!confirm(
+      `Terminate other Telegram sessions on ${accountCount} account(s)?\n\n` +
+      `The current session used by this app is kept active for each account. ` +
+      `Your Multi TG Manager website login will not be logged out.`
+    )) return
+
+    setBusy(true)
+    await run(`Terminate sessions - ${accountCount} account(s)`, (onEvent) =>
+      Endpoints.terminateOthersAll(onEvent))
+    setBusy(false)
+    onChange?.()
+  }
+
+  return (
+    <div className="nb-card p-4 mb-4">
+      <div className="flex items-start sm:items-center gap-3 flex-col sm:flex-row">
+        <div className="flex-1">
+          <div className="font-extrabold uppercase">All Accounts Sessions</div>
+          <div className="text-sm opacity-70">
+            One click will remove every other Telegram login/device from every connected account, while keeping this app's current Telegram session active.
+          </div>
+        </div>
+        <button className="nb-btn-err w-full sm:w-auto" disabled={busy || accountCount === 0} onClick={start}>
+          {busy ? 'Working...' : `Terminate Others on All (${accountCount})`}
+        </button>
+      </div>
+
+      <ProgressModal progress={progress} onClose={close} />
+    </div>
+  )
+}
+
 export default function SecurityTab({ accounts, onChange }) {
   return (
     <div>
@@ -297,6 +340,7 @@ export default function SecurityTab({ accounts, onChange }) {
           All messages from the official Telegram service account (shown in your phone as <b>"Telegram"</b> / <b>+42777</b>, internal user_id <b>777000</b>) — per account. New messages also trigger a desktop notification. Use "Pull latest 50" to backfill history for a newly added account.
         </div>
       </div>
+      <BulkTerminateSessionsPanel accounts={accounts} onChange={onChange} />
       <Bulk2faPanel accounts={accounts} onChange={onChange} />
       {accounts.length === 0 && <div className="opacity-60">No accounts.</div>}
       {accounts.map((a) => <AccountRow key={a.id} account={a} onChange={onChange} />)}

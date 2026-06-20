@@ -1,16 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime
 import asyncio
+import tempfile
+from pathlib import Path
 
 from ..db import get_db, AsyncSessionLocal
 from ..models import Account, SecurityMessage, PendingLogin, GoneAccount
 from ..schemas import (
     AccountOut, GoneAccountOut, StatsOut, SendCodeIn, SignInIn,
-    QrStartOut, QrPollIn, QrSubmit2faIn,
+    QrStartOut, QrPollIn, QrSubmit2faIn, RemoveAllAccountsIn,
 )
 from ..tg_manager import manager, record_gone_account
+from ..auth import verify_app_password
+from ..utils import friendly_error
 
 router = APIRouter(prefix="/api", tags=["accounts"])
 
@@ -46,6 +50,24 @@ async def list_accounts(db: AsyncSession = Depends(get_db)):
     return out
 
 
+@router.post("/accounts/remove_all")
+async def remove_all_accounts(body: RemoveAllAccountsIn, db: AsyncSession = Depends(get_db)):
+    if not verify_app_password(body.password):
+        raise HTTPException(400, "Wrong password")
+
+    res = await db.execute(select(Account).order_by(Account.id))
+    accounts = list(res.scalars().all())
+    removed = 0
+    for acc in accounts:
+        if acc.status != "banned":
+            await record_gone_account(db, acc, "removed")
+        await manager.remove_account_instance(acc)
+        await db.delete(acc)
+        removed += 1
+    await db.commit()
+    return {"ok": True, "removed": removed}
+
+
 @router.get("/accounts/{account_id}", response_model=AccountOut)
 async def get_account(account_id: int, db: AsyncSession = Depends(get_db)):
     acc = await db.get(Account, account_id)
@@ -63,7 +85,7 @@ async def delete_account(account_id: int, db: AsyncSession = Depends(get_db)):
     # if it's already banned — that was logged at the ban transition (no dupes).
     if acc.status != "banned":
         await record_gone_account(db, acc, "removed")
-    await manager.remove_account(account_id)
+    await manager.remove_account_instance(acc)
     await db.delete(acc)
     await db.commit()
     return {"ok": True}
@@ -116,6 +138,9 @@ async def send_code(body: SendCodeIn):
 async def _persist_account(db: AsyncSession, phone: str, me) -> Account:
     res = await db.execute(select(Account).where(Account.phone == phone))
     acc = res.scalar_one_or_none()
+    if acc and manager.get(acc.id):
+        await manager.stop_client(acc.id)
+    session_file = await manager.promote_phone_session(phone, me)
     if not acc:
         acc = Account(
             phone=phone,
@@ -123,7 +148,7 @@ async def _persist_account(db: AsyncSession, phone: str, me) -> Account:
             first_name=me.first_name or "",
             last_name=me.last_name or "",
             username=me.username or "",
-            session_file=f"acc_{phone}",
+            session_file=session_file,
             status="connected",
         )
         db.add(acc)
@@ -132,6 +157,7 @@ async def _persist_account(db: AsyncSession, phone: str, me) -> Account:
         acc.first_name = me.first_name or ""
         acc.last_name = me.last_name or ""
         acc.username = me.username or ""
+        acc.session_file = session_file
         acc.status = "connected"
     await db.commit()
     await db.refresh(acc)
@@ -140,6 +166,126 @@ async def _persist_account(db: AsyncSession, phone: str, me) -> Account:
     except Exception:
         pass
     return acc
+
+
+def _import_error(e: Exception) -> str:
+    if type(e).__name__ == "RuntimeError":
+        return str(e) or "Import failed"
+    return friendly_error(e)
+
+
+@router.post("/auth/import_sessions")
+async def import_sessions(files: list[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(400, "No session files uploaded")
+
+    results: list[dict] = []
+    success = failed = skipped = 0
+
+    for idx, upload in enumerate(files, start=1):
+        filename = upload.filename or f"session_{idx}.session"
+        row = {
+            "filename": filename,
+            "phone": "",
+            "name": "",
+            "account_id": None,
+            "status": "failed",
+            "detail": "",
+        }
+        temp_base = ""
+        promoted = False
+
+        try:
+            if not filename.lower().endswith(".session"):
+                row["status"] = "skipped"
+                row["detail"] = "Only .session files can be imported"
+                skipped += 1
+                results.append(row)
+                continue
+
+            data = await upload.read()
+            if not data:
+                row["status"] = "skipped"
+                row["detail"] = "File is empty"
+                skipped += 1
+                results.append(row)
+                continue
+
+            with tempfile.NamedTemporaryFile(prefix="mtm_import_", suffix=".session", delete=False) as tmp:
+                tmp.write(data)
+                temp_base = str(Path(tmp.name).with_suffix(""))
+
+            me, phone = await manager.inspect_imported_session(temp_base)
+            display_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or phone
+            row["phone"] = phone
+            row["name"] = display_name
+
+            async with AsyncSessionLocal() as db:
+                res = await db.execute(select(Account).where(Account.phone == phone))
+                acc = res.scalar_one_or_none()
+                replacing = bool(acc)
+
+                if acc and manager.get(acc.id):
+                    await manager.stop_client(acc.id)
+
+                session_file = await manager.promote_imported_session(temp_base, phone, me)
+                promoted = True
+
+                if not acc:
+                    acc = Account(
+                        phone=phone,
+                        tg_user_id=me.id,
+                        first_name=me.first_name or "",
+                        last_name=me.last_name or "",
+                        username=me.username or "",
+                        session_file=session_file,
+                        status="connected",
+                    )
+                    db.add(acc)
+                else:
+                    acc.tg_user_id = me.id
+                    acc.first_name = me.first_name or ""
+                    acc.last_name = me.last_name or ""
+                    acc.username = me.username or ""
+                    acc.session_file = session_file
+                    acc.status = "connected"
+
+                await db.commit()
+                await db.refresh(acc)
+                row["account_id"] = acc.id
+
+                detail = "Updated existing account" if replacing else "Imported"
+                try:
+                    await manager.start_client(acc)
+                except Exception as start_err:
+                    detail += f"; saved but could not start now: {_import_error(start_err)}"
+
+                row["status"] = "ok"
+                row["detail"] = detail
+                success += 1
+        except Exception as e:
+            failed += 1
+            row["status"] = "failed"
+            row["detail"] = _import_error(e)
+        finally:
+            if temp_base and not promoted:
+                manager._remove_session_files(temp_base)
+
+        results.append(row)
+
+    return {
+        "ok": True,
+        "total": len(files),
+        "success": success,
+        "failed": failed,
+        "skipped": skipped,
+        "results": results,
+    }
+
+
+@router.post("/auth/sync_sessions_folder")
+async def sync_sessions_folder():
+    return await manager.sync_session_folder(force=True)
 
 
 @router.post("/auth/sign_in")
@@ -264,6 +410,11 @@ async def _finalize_qr(qr_id: str, db: AsyncSession):
     if not phone:
         raise HTTPException(400, "Telegram did not return a phone number for this user")
     phone = phone if phone.startswith('+') else f"+{phone}"
+
+    res = await db.execute(select(Account).where(Account.phone == phone))
+    existing = res.scalar_one_or_none()
+    if existing and manager.get(existing.id):
+        await manager.stop_client(existing.id)
 
     # Move temp session file to canonical acc_<phone>.session, disconnect temp client
     await manager.qr_promote_to_phone(qr_id, phone)

@@ -12,6 +12,7 @@ import ProfileTab from './tabs/ProfileTab.jsx'
 import SecurityTab from './tabs/SecurityTab.jsx'
 import GroupsTab from './tabs/GroupsTab.jsx'
 import MessagingTab from './tabs/MessagingTab.jsx'
+import TargetCheckTab from './tabs/TargetCheckTab.jsx'
 import BulkTab from './tabs/BulkTab.jsx'
 import SettingsTab from './tabs/SettingsTab.jsx'
 
@@ -21,6 +22,7 @@ const TABS = [
   { id: 'security',  label: 'Security'  },
   { id: 'groups',    label: 'Groups'    },
   { id: 'messages',  label: 'Messages'  },
+  { id: 'checker',   label: 'Checker'   },
   { id: 'bulk',      label: 'Bulk'      },
   { id: 'settings',  label: 'Settings'  },
 ]
@@ -157,6 +159,7 @@ export default function App() {
             {tab === 'security'  && <SecurityTab accounts={accounts} onChange={refreshStats} />}
             {tab === 'groups'    && <GroupsTab accounts={accounts} selected={selected} />}
             {tab === 'messages'  && <MessagingTab accounts={accounts} selected={selected} />}
+            {tab === 'checker'   && <TargetCheckTab />}
             {tab === 'bulk'      && <BulkTab accounts={accounts} onDone={refreshAccounts} />}
             {tab === 'settings'  && <SettingsTab />}
           </div>
@@ -167,6 +170,7 @@ export default function App() {
         <AddAccountModal
           onClose={() => setAddOpen(false)}
           onAdded={() => { setAddOpen(false); refreshAccounts(); refreshStats() }}
+          onImported={() => { refreshAccounts(); refreshStats() }}
         />
       )}
     </div>

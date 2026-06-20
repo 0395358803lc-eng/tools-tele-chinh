@@ -3,9 +3,9 @@ import QRCode from 'qrcode'
 import { Endpoints } from '../lib/api'
 import { useToast } from '../lib/toast.jsx'
 
-export default function AddAccountModal({ onClose, onAdded }) {
+export default function AddAccountModal({ onClose, onAdded, onImported }) {
   const toast = useToast()
-  const [method, setMethod] = useState('phone') // 'phone' | 'qr'
+  const [method, setMethod] = useState('phone') // 'phone' | 'qr' | 'session'
 
   // Phone flow
   const [step, setStep] = useState(1) // 1: phone, 2: code, 3: 2fa
@@ -24,6 +24,10 @@ export default function AddAccountModal({ onClose, onAdded }) {
   const [qr2faPwd, setQr2faPwd] = useState('')
   const pollRef = useRef(null)
   const qrIdRef = useRef(null)
+
+  // Session file import flow
+  const [sessionFiles, setSessionFiles] = useState([])
+  const [sessionResult, setSessionResult] = useState(null)
 
   async function close() {
     if (phone) { try { await Endpoints.authCancel(phone) } catch {} }
@@ -174,11 +178,69 @@ export default function AddAccountModal({ onClose, onAdded }) {
   }
 
   // Switch to QR tab → auto-start. Switch away → cancel.
+  function onPickSessionFiles(e) {
+    const picked = Array.from(e.target.files || [])
+    setSessionFiles(picked)
+    setSessionResult(null)
+  }
+
+  async function importSessionFiles() {
+    if (sessionFiles.length === 0) {
+      toast.error('Choose at least one .session file')
+      return
+    }
+    setBusy(true)
+    setHint(`Importing ${sessionFiles.length} session file${sessionFiles.length === 1 ? '' : 's'}...`)
+    setSessionResult(null)
+    try {
+      const r = await Endpoints.importSessions(sessionFiles)
+      setSessionResult(r)
+      if ((r.success || 0) > 0) {
+        toast.success(`Imported ${r.success} account${r.success === 1 ? '' : 's'}`)
+        onImported?.()
+      }
+      const needsAttention = (r.failed || 0) + (r.skipped || 0)
+      if (needsAttention > 0) {
+        toast.info(`${needsAttention} session file${needsAttention === 1 ? '' : 's'} need attention`)
+      }
+    } catch (e) {
+      toast.error(e.message)
+    } finally {
+      setBusy(false)
+      setHint('')
+    }
+  }
+
+  async function scanSessionsFolder() {
+    setBusy(true)
+    setHint('Scanning sessions folder...')
+    setSessionResult(null)
+    try {
+      const r = await Endpoints.syncSessionsFolder()
+      setSessionResult(r)
+      if ((r.success || 0) > 0) {
+        toast.success(`Added ${r.success} pasted session${r.success === 1 ? '' : 's'}`)
+        onImported?.()
+      } else if ((r.failed || 0) === 0) {
+        toast.info('No new pasted sessions found')
+      }
+      const needsAttention = (r.failed || 0) + (r.skipped || 0)
+      if (needsAttention > 0) {
+        toast.info(`${needsAttention} session file${needsAttention === 1 ? '' : 's'} reported`)
+      }
+    } catch (e) {
+      toast.error(e.message)
+    } finally {
+      setBusy(false)
+      setHint('')
+    }
+  }
+
   useEffect(() => {
     if (method === 'qr' && !qrIdRef.current) {
       startQr()
     }
-    if (method === 'phone' && qrIdRef.current) {
+    if (method !== 'qr' && qrIdRef.current) {
       const id = qrIdRef.current
       qrIdRef.current = null
       setQrId(null); setQrUrl(''); setQrImg(''); setQrState('idle')
@@ -191,7 +253,7 @@ export default function AddAccountModal({ onClose, onAdded }) {
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={close}>
-      <div className="nb-card p-6 w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+      <div className="nb-card p-6 w-full max-w-2xl max-h-[90vh] overflow-auto" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="font-extrabold uppercase tracking-tight text-xl">
             Add Account {step === 3 && method === 'phone' && <span className="nb-badge bg-brand-violet text-black ml-2">2FA</span>}
@@ -209,6 +271,10 @@ export default function AddAccountModal({ onClose, onAdded }) {
             className={`nb-tab flex-1 ${method === 'qr' ? 'nb-tab-active' : ''}`}
             onClick={() => setMethod('qr')}
           >QR Code</button>
+          <button
+            className={`nb-tab flex-1 ${method === 'session' ? 'nb-tab-active' : ''}`}
+            onClick={() => setMethod('session')}
+          >Session Files</button>
         </div>
 
         {method === 'phone' && step === 1 && (
@@ -327,6 +393,69 @@ export default function AddAccountModal({ onClose, onAdded }) {
             <button className="nb-btn-pri w-full" disabled={busy || !qr2faPwd} onClick={submitQr2fa}>
               {busy ? 'Submitting…' : 'Submit 2FA'}
             </button>
+          </div>
+        )}
+
+        {method === 'session' && (
+          <div className="space-y-3">
+            <div className="text-sm opacity-80">
+              Import one or more Telethon <span className="font-mono">.session</span> files, or paste them into the sessions folder and scan. If one file fails, the rest will still be imported.
+            </div>
+
+            <label className="block">
+              <div className="text-xs font-bold uppercase mb-1">Session files</div>
+              <input
+                type="file"
+                className="nb-input"
+                accept=".session"
+                multiple
+                disabled={busy}
+                onChange={onPickSessionFiles}
+              />
+            </label>
+
+            {sessionFiles.length > 0 && (
+              <div className="nb-card-sm p-2 max-h-28 overflow-auto text-xs">
+                {sessionFiles.map((f, i) => (
+                  <div key={`${f.name}-${i}`} className="flex gap-2">
+                    <span className="font-mono opacity-60">{i + 1}.</span>
+                    <span className="truncate">{f.name}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <button className="nb-btn-pri w-full" disabled={busy || sessionFiles.length === 0} onClick={importSessionFiles}>
+              {busy ? 'Importing...' : `Import ${sessionFiles.length || ''} Session File${sessionFiles.length === 1 ? '' : 's'}`}
+            </button>
+
+            <button className="nb-btn-info w-full" disabled={busy} onClick={scanSessionsFolder}>
+              Scan Pasted Sessions Folder
+            </button>
+
+            {sessionResult && (
+              <div className="space-y-2">
+                <div className="flex gap-2 flex-wrap">
+                  <span className="nb-badge bg-brand-ok text-black">{sessionResult.success || 0} imported</span>
+                  <span className="nb-badge bg-brand-err text-black">{sessionResult.failed || 0} failed</span>
+                  <span className="nb-badge bg-brand-warn text-black">{sessionResult.skipped || 0} skipped</span>
+                </div>
+                <div className="space-y-1 max-h-64 overflow-auto">
+                  {(sessionResult.results || []).map((r, i) => (
+                    <div key={`${r.filename}-${i}`} className="nb-card-sm p-2 text-sm flex items-center gap-2">
+                      <span className={'nb-badge text-black ' + (r.status === 'ok' ? 'bg-brand-ok' : r.status === 'skipped' ? 'bg-brand-warn' : 'bg-brand-err')}>
+                        {r.status}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="font-bold truncate">{r.name || r.phone || r.filename}</div>
+                        <div className="font-mono text-[11px] opacity-70 truncate">{r.filename}{r.phone ? ` - ${r.phone}` : ''}</div>
+                      </div>
+                      {r.detail && <div className="text-xs opacity-75 max-w-[45%] truncate" title={r.detail}>{r.detail}</div>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 

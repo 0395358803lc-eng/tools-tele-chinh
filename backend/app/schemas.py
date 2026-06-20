@@ -55,6 +55,10 @@ class SignInIn(BaseModel):
     password: Optional[str] = None
 
 
+class RemoveAllAccountsIn(BaseModel):
+    password: str
+
+
 class QrStartOut(BaseModel):
     qr_id: str
     url: str
@@ -201,6 +205,10 @@ class OpenChatIn(BaseModel):
 class ChatSendIn(BaseModel):
     peer: str   # username or numeric id (as returned by /open)
     text: str
+
+
+class TargetUsageCheckIn(BaseModel):
+    target: str
 
 
 class ReactionAssignment(BaseModel):

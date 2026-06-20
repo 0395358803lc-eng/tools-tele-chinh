@@ -83,6 +83,8 @@ class TgClientManager:
         self._locks_guard = asyncio.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._new_msg_callbacks: list = []
+        self._session_scan_lock = asyncio.Lock()
+        self._session_scan_seen: dict[str, tuple[int, int]] = {}
 
     def set_loop(self, loop):
         self._loop = loop
@@ -99,6 +101,268 @@ class TgClientManager:
     def _session_path(self, phone: str) -> str:
         safe = re.sub(r"[^0-9]", "", phone)
         return str(settings.sessions_path / f"acc_{safe}")
+
+    @staticmethod
+    def _phone_file_part(phone: str) -> str:
+        digits = re.sub(r"\D", "", phone or "")
+        return digits or "unknown"
+
+    @staticmethod
+    def _username_file_part(username: str | None, user_id: int | None = None) -> str:
+        user = re.sub(r"[^A-Za-z0-9_]", "", (username or "").strip().lstrip("@"))
+        if user:
+            return user[:64]
+        if user_id:
+            return f"user{user_id}"
+        return "no_username"
+
+    def session_file_name(self, phone: str, username: str | None = None, user_id: int | None = None) -> str:
+        return f"{self._username_file_part(username, user_id)}_{self._phone_file_part(phone)}"
+
+    def _desired_session_path(self, phone: str, username: str | None = None, user_id: int | None = None) -> str:
+        return str(settings.sessions_path / self.session_file_name(phone, username, user_id))
+
+    def _path_from_session_file(self, session_file: str) -> str:
+        p = Path(session_file or "")
+        if p.suffix == ".session":
+            p = p.with_suffix("")
+        if p.is_absolute():
+            return str(p)
+        return str(settings.sessions_path / p.name)
+
+    def _session_path_candidates(self, acc: Account) -> list[str]:
+        candidates = []
+        if acc.session_file:
+            candidates.append(self._path_from_session_file(acc.session_file))
+        candidates.append(self._desired_session_path(acc.phone, acc.username, acc.tg_user_id))
+        candidates.append(self._path_from_session_file(f"acc_{acc.phone}"))
+        candidates.append(self._session_path(acc.phone))
+
+        unique = []
+        seen = set()
+        for c in candidates:
+            if c and c not in seen:
+                unique.append(c)
+                seen.add(c)
+        return unique
+
+    def _session_path_for_account(self, acc: Account) -> str:
+        candidates = self._session_path_candidates(acc)
+        for c in candidates:
+            if Path(c + ".session").exists():
+                return c
+        return candidates[0]
+
+    def _move_session_files(self, src_base: str, dst_base: str):
+        src = Path(src_base)
+        dst = Path(dst_base)
+        if src.resolve() == dst.resolve():
+            return
+
+        suffixes = [".session", ".session-journal", ".session-wal", ".session-shm"]
+        if not any(Path(str(src) + suffix).exists() for suffix in suffixes):
+            return
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        for suffix in suffixes:
+            self._safe_unlink(str(dst) + suffix)
+        for suffix in suffixes:
+            s = Path(str(src) + suffix)
+            if not s.exists():
+                continue
+            d = Path(str(dst) + suffix)
+            shutil.move(str(s), str(d))
+
+    def _remove_session_files(self, base: str):
+        for suffix in [".session", ".session-journal", ".session-wal", ".session-shm"]:
+            self._safe_unlink(base + suffix)
+
+    async def promote_phone_session(self, phone: str, me: TgUser) -> str:
+        dst = self._desired_session_path(phone, getattr(me, "username", None), getattr(me, "id", None))
+        self._move_session_files(self._session_path(phone), dst)
+        return Path(dst).name
+
+    async def inspect_imported_session(self, session_base: str) -> tuple[TgUser, str]:
+        """Open an uploaded Telethon session and return its user + normalized phone.
+
+        The caller owns moving or deleting the session files after this returns.
+        """
+        cli = TelegramClient(session_base, settings.TG_API_ID, settings.TG_API_HASH)
+        try:
+            await asyncio.wait_for(cli.connect(), timeout=20)
+            if not await asyncio.wait_for(cli.is_user_authorized(), timeout=20):
+                raise RuntimeError("Session is not authorized")
+            me = await asyncio.wait_for(cli.get_me(), timeout=30)
+            if not me:
+                raise RuntimeError("Could not read account info from this session")
+            phone = getattr(me, "phone", None)
+            if not phone:
+                raise RuntimeError("Telegram did not return a phone number for this session")
+            phone = phone if phone.startswith("+") else f"+{phone}"
+            return me, phone
+        finally:
+            try:
+                await cli.disconnect()
+            except Exception:
+                pass
+            try:
+                cli.session.close()
+            except Exception:
+                pass
+
+    async def promote_imported_session(self, session_base: str, phone: str, me: TgUser) -> str:
+        dst = self._desired_session_path(phone, getattr(me, "username", None), getattr(me, "id", None))
+        self._move_session_files(session_base, dst)
+        if not Path(dst + ".session").exists():
+            raise RuntimeError("Imported session file could not be saved")
+        return Path(dst).name
+
+    @staticmethod
+    def _session_error_detail(e: Exception) -> str:
+        if type(e).__name__ == "RuntimeError":
+            return str(e) or "Session import failed"
+        msg = str(e)
+        return f"{type(e).__name__}: {msg[:140]}" if msg else type(e).__name__
+
+    @staticmethod
+    def _is_importable_session_file(path: Path) -> bool:
+        if path.suffix.lower() != ".session":
+            return False
+        stem = path.stem.lower()
+        return not (stem.startswith("qr_") or stem.startswith("mtm_import_"))
+
+    async def sync_session_folder(self, force: bool = False) -> dict:
+        """Discover authorized .session files pasted into the sessions folder.
+
+        This fills missing Account rows without asking for a login code. It does
+        not create a new Telegram auth key; it only reuses session files that are
+        already authorized.
+        """
+        async with self._session_scan_lock:
+            session_files = [
+                p for p in sorted(settings.sessions_path.glob("*.session"))
+                if self._is_importable_session_file(p)
+            ]
+
+            async with AsyncSessionLocal() as db:
+                res = await db.execute(select(Account))
+                accounts = list(res.scalars().all())
+
+            known_paths: set[str] = set()
+            for acc in accounts:
+                for base in self._session_path_candidates(acc):
+                    try:
+                        known_paths.add(str(Path(base + ".session").resolve()).lower())
+                    except Exception:
+                        pass
+
+            success = failed = skipped = 0
+            results: list[dict] = []
+
+            for path in session_files:
+                row = {
+                    "filename": path.name,
+                    "phone": "",
+                    "name": "",
+                    "account_id": None,
+                    "status": "failed",
+                    "detail": "",
+                }
+
+                try:
+                    resolved = str(path.resolve()).lower()
+                    if resolved in known_paths:
+                        if force:
+                            row["status"] = "skipped"
+                            row["detail"] = "Already added"
+                            skipped += 1
+                            results.append(row)
+                        continue
+
+                    stat = path.stat()
+                    signature = (int(stat.st_size), int(stat.st_mtime_ns))
+                    if not force and self._session_scan_seen.get(resolved) == signature:
+                        continue
+                    self._session_scan_seen[resolved] = signature
+
+                    session_base = str(path.with_suffix(""))
+                    me, phone = await self.inspect_imported_session(session_base)
+                    display_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or phone
+                    row["phone"] = phone
+                    row["name"] = display_name
+
+                    async with AsyncSessionLocal() as db:
+                        res = await db.execute(select(Account).where(Account.phone == phone))
+                        acc = res.scalar_one_or_none()
+                        replacing = bool(acc)
+
+                        if acc:
+                            candidate_paths = []
+                            for base in self._session_path_candidates(acc):
+                                try:
+                                    candidate_paths.append(str(Path(base + ".session").resolve()).lower())
+                                except Exception:
+                                    pass
+                            has_existing_file = any(Path(base + ".session").exists() for base in self._session_path_candidates(acc))
+                            if resolved not in candidate_paths and has_existing_file:
+                                row["status"] = "skipped"
+                                row["detail"] = "Account already exists from another session file"
+                                row["account_id"] = acc.id
+                                skipped += 1
+                                results.append(row)
+                                continue
+                            if self.get(acc.id):
+                                await self.stop_client(acc.id)
+
+                        session_file = path.stem
+                        if not acc:
+                            acc = Account(
+                                phone=phone,
+                                tg_user_id=me.id,
+                                first_name=me.first_name or "",
+                                last_name=me.last_name or "",
+                                username=me.username or "",
+                                session_file=session_file,
+                                status="connected",
+                            )
+                            db.add(acc)
+                        else:
+                            acc.tg_user_id = me.id
+                            acc.first_name = me.first_name or ""
+                            acc.last_name = me.last_name or ""
+                            acc.username = me.username or ""
+                            acc.session_file = session_file
+                            acc.status = "connected"
+
+                        await db.commit()
+                        await db.refresh(acc)
+                        row["account_id"] = acc.id
+
+                    detail = "Updated from sessions folder" if replacing else "Imported from sessions folder"
+                    try:
+                        await self.start_client(acc)
+                    except Exception as start_err:
+                        detail += f"; saved but could not start now: {self._session_error_detail(start_err)}"
+
+                    row["status"] = "ok"
+                    row["detail"] = detail
+                    success += 1
+                    results.append(row)
+                    known_paths.add(resolved)
+                except Exception as e:
+                    row["status"] = "failed"
+                    row["detail"] = self._session_error_detail(e)
+                    failed += 1
+                    results.append(row)
+
+            return {
+                "ok": True,
+                "total": len(session_files),
+                "success": success,
+                "failed": failed,
+                "skipped": skipped,
+                "results": results,
+            }
 
     def get(self, account_id: int) -> Optional[TelegramClient]:
         return self._clients.get(account_id)
@@ -124,6 +388,21 @@ class TgClientManager:
 
         await asyncio.gather(*(_start_one(acc) for acc in accounts))
 
+        async def _sync_pasted_sessions():
+            try:
+                report = await self.sync_session_folder()
+                if report.get("success") or report.get("failed"):
+                    log.info(
+                        "session folder sync: %s imported, %s failed, %s skipped",
+                        report.get("success", 0),
+                        report.get("failed", 0),
+                        report.get("skipped", 0),
+                    )
+            except Exception as e:
+                log.warning("session folder sync failed: %s", e)
+
+        asyncio.create_task(_sync_pasted_sessions())
+
     async def shutdown(self):
         for cli in list(self._clients.values()):
             try:
@@ -148,7 +427,7 @@ class TgClientManager:
         async with lock:
             if acc.id in self._clients:
                 return self._clients[acc.id]
-            cli = TelegramClient(self._session_path(acc.phone), settings.TG_API_ID, settings.TG_API_HASH)
+            cli = TelegramClient(self._session_path_for_account(acc), settings.TG_API_ID, settings.TG_API_HASH)
             await cli.connect()
             if not await cli.is_user_authorized():
                 await cli.disconnect()
@@ -180,20 +459,22 @@ class TgClientManager:
             except Exception:
                 pass
 
+    async def remove_account_instance(self, acc: Account, delete_session_file: bool = True):
+        await self.stop_client(acc.id)
+        if delete_session_file:
+            for base in self._session_path_candidates(acc):
+                self._remove_session_files(base)
+
     async def remove_account(self, account_id: int, delete_session_file: bool = True):
-        cli = self._clients.get(account_id)
-        if cli:
-            await self.stop_client(account_id)
         if delete_session_file:
             async with AsyncSessionLocal() as db:
                 acc = await db.get(Account, account_id)
                 if acc:
-                    p = Path(self._session_path(acc.phone) + ".session")
-                    try:
-                        if p.exists():
-                            p.unlink()
-                    except Exception:
-                        pass
+                    await self.remove_account_instance(acc, delete_session_file=True)
+                else:
+                    await self.stop_client(account_id)
+        else:
+            await self.stop_client(account_id)
 
     # ---------- auth flow ----------
     # Pending logins are clients that successfully sent a code OR successfully
@@ -410,18 +691,14 @@ class TgClientManager:
             except Exception: pass
         try: await entry['client'].disconnect()
         except Exception: pass
-        src = entry['session_path'] + ".session"
-        dst = self._session_path(phone) + ".session"
+        src = entry['session_path']
+        dst = self._session_path(phone)
         try:
-            if Path(dst).exists():
-                # Existing canonical session takes precedence — drop the temp one
-                self._safe_unlink(src)
-            elif Path(src).exists():
-                shutil.move(src, dst)
+            self._move_session_files(src, dst)
+            return dst
         except Exception as e:
             log.warning("qr session move failed: %s", e)
-        return dst
-
+            return dst
     async def qr_cancel(self, qr_id: str):
         entry = self._qr_pending.pop(qr_id, None)
         if not entry:
