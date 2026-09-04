@@ -203,6 +203,27 @@ class TgClientManager:
             )
             return False
 
+    @staticmethod
+    def _safe_remove_event_handler(cli, handler, *, context: str) -> bool:
+        """Detach a Telethon callback without allowing cleanup to abort lifecycle."""
+        try:
+            cli.remove_event_handler(handler)
+            return True
+        except (OSError, RuntimeError) as exc:
+            log.debug(
+                "Telegram handler detach failed context=%s error=%s",
+                context,
+                type(exc).__name__,
+            )
+            return False
+        except Exception as exc:
+            log.warning(
+                "unexpected Telegram handler detach failure context=%s error=%s",
+                context,
+                type(exc).__name__,
+            )
+            return False
+
     # ---------- session-file compatibility wrappers ----------
     @staticmethod
     def normalize_phone(phone: str) -> str:
@@ -726,8 +747,11 @@ class TgClientManager:
                 handler_entry = self._service_handlers.pop(account_id, None)
                 if handler_entry:
                     old_cli, handler = handler_entry
-                    with suppress(Exception):
-                        old_cli.remove_event_handler(handler)
+                    self._safe_remove_event_handler(
+                        old_cli,
+                        handler,
+                        context=f"stop_client:{account_id}",
+                    )
                 await self._safe_disconnect(
                     cli,
                     context=f"stop_client:{account_id}",
@@ -819,8 +843,11 @@ class TgClientManager:
                 return sent.phone_code_hash
             finally:
                 if not keep:
-                    with suppress(Exception, asyncio.CancelledError):
-                        await cli.disconnect()
+                    await self._safe_disconnect(
+                        cli,
+                        context=f"send_code_cleanup:{phone}",
+                        suppress_cancelled=True,
+                    )
                     self._remove_session_files(session_path)
 
     async def submit_code(self, phone: str, code: str) -> tuple[TgUser | None, bool]:
@@ -850,8 +877,11 @@ class TgClientManager:
         pend['me'] = me
         # Keep the disconnected temp file until the transactional DB/session
         # promotion succeeds; it is bounded by the pending TTL.
-        with suppress(Exception, asyncio.CancelledError):
-            await cli.disconnect()
+        await self._safe_disconnect(
+            cli,
+            context=f"submit_code_complete:{phone}",
+            suppress_cancelled=True,
+        )
         return me, False
 
     async def submit_2fa(self, phone: str, password: str) -> TgUser:
@@ -876,8 +906,11 @@ class TgClientManager:
             )
         pend['authorized'] = True
         pend['me'] = me
-        with suppress(Exception, asyncio.CancelledError):
-            await cli.disconnect()
+        await self._safe_disconnect(
+            cli,
+            context=f"submit_2fa_complete:{phone}",
+            suppress_cancelled=True,
+        )
         return me
 
     async def cancel_pending(self, phone: str):
@@ -896,8 +929,11 @@ class TgClientManager:
     async def _kill_pending(self, phone: str, disconnect: bool = True, remove_session: bool = True):
         pend = self._pending.pop(phone, None)
         if pend and disconnect:
-            with suppress(Exception, asyncio.CancelledError):
-                await pend['client'].disconnect()
+            await self._safe_disconnect(
+                pend.get('client'),
+                context=f"kill_pending:{phone}",
+                suppress_cancelled=True,
+            )
         if pend and remove_session:
             self._remove_session_files(pend.get('session_path', ''))
 
@@ -944,8 +980,11 @@ class TgClientManager:
             keep = True
         finally:
             if not keep:
-                with suppress(Exception, asyncio.CancelledError):
-                    await cli.disconnect()
+                await self._safe_disconnect(
+                    cli,
+                    context=f"qr_start_cleanup:{qr_id}",
+                    suppress_cancelled=True,
+                )
                 self._remove_session_files(sess_path)
         return {
             'qr_id': qr_id,
@@ -1007,8 +1046,11 @@ class TgClientManager:
                 await old
         cli: TelegramClient = entry['client']
         if entry.get('closed_at') is not None or not cli.is_connected():
-            with suppress(Exception, asyncio.CancelledError):
-                await cli.disconnect()
+            await self._safe_disconnect(
+                cli,
+                context=f"qr_recreate_closed:{qr_id}",
+                suppress_cancelled=True,
+            )
             self._remove_session_files(entry['session_path'])
             cli = TelegramClient(
                 entry['session_path'], settings.tg_api_id, settings.TG_API_HASH
@@ -1018,8 +1060,11 @@ class TgClientManager:
                     cli.connect(), timeout=float(settings.TELEGRAM_CONNECT_TIMEOUT)
                 )
             except BaseException:
-                with suppress(Exception, asyncio.CancelledError):
-                    await cli.disconnect()
+                await self._safe_disconnect(
+                    cli,
+                    context=f"qr_recreate_connect_failed:{qr_id}",
+                    suppress_cancelled=True,
+                )
                 self._remove_session_files(entry['session_path'])
                 raise
             entry['client'] = cli
@@ -1111,8 +1156,11 @@ class TgClientManager:
             wait_task.cancel()
             with suppress(asyncio.CancelledError):
                 await wait_task
-        with suppress(Exception, asyncio.CancelledError):
-            await entry['client'].disconnect()
+        await self._safe_disconnect(
+            entry.get('client'),
+            context=f"qr_promote:{qr_id}",
+            suppress_cancelled=True,
+        )
         return entry['session_path']
 
     async def finish_qr(self, qr_id: str, *, remove_session: bool):
@@ -1132,8 +1180,11 @@ class TgClientManager:
             wait_task.cancel()
             with suppress(asyncio.CancelledError):
                 await wait_task
-        with suppress(Exception, asyncio.CancelledError):
-            await entry['client'].disconnect()
+        await self._safe_disconnect(
+            entry.get('client'),
+            context=f"qr_close:{qr_id}",
+            suppress_cancelled=True,
+        )
         self._remove_session_files(entry.get('session_path', ''))
         entry['closed_at'] = entry.get('closed_at') or time.monotonic()
         if remove:
@@ -1150,8 +1201,11 @@ class TgClientManager:
         previous = self._service_handlers.pop(account_id, None)
         if previous:
             old_cli, old_handler = previous
-            with suppress(Exception):
-                old_cli.remove_event_handler(old_handler)
+            self._safe_remove_event_handler(
+                old_cli,
+                old_handler,
+                context=f"replace_listener:{account_id}",
+            )
 
         async def _handler(event):
             try:
