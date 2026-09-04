@@ -92,14 +92,13 @@ class SessionFileStore:
                 return candidate
         return candidates[0]
 
-    @staticmethod
-    def safe_unlink(path: str):
+    def safe_unlink(self, path: str):
         try:
             p = Path(path)
             if p.exists():
                 p.unlink()
         except OSError as exc:
-            logging.getLogger("session_files").debug(
+            self._log.debug(
                 "could not remove session artifact path=%s error=%s",
                 path,
                 type(exc).__name__,
