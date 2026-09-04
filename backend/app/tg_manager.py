@@ -25,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .config import settings
 from .account_scheduler import AccountActionScheduler
+from .client_cleanup import TelegramClientCleanup
 from .session_files import SessionFileStore
 from .db import AsyncSessionLocal
 from .models import Account, AppSetting, SecurityMessage, GoneAccount
@@ -88,6 +89,7 @@ class TgClientManager:
         # Lifecycle locks above still protect client creation/removal, while the
         # scheduler serializes mutations per account and handles FloodWait/pacing.
         self._action_scheduler = AccountActionScheduler(log)
+        self._cleanup = TelegramClientCleanup(log)
         self._session_files = SessionFileStore(log)
         self.auto_reconnect = True
         self._reconnect_attempts: dict[int, int] = {}
@@ -138,6 +140,25 @@ class TgClientManager:
     def resume_actions(self):
         """Allow actions after startup (mainly useful for lifespan/tests)."""
         self._action_scheduler.resume()
+
+    async def _safe_disconnect(
+        self,
+        cli,
+        *,
+        context: str,
+        suppress_cancelled: bool = False,
+    ) -> bool:
+        return await self._cleanup.disconnect(
+            cli,
+            context=context,
+            suppress_cancelled=suppress_cancelled,
+        )
+
+    def _safe_close_session(self, cli, *, context: str) -> bool:
+        return self._cleanup.close_session(cli, context=context)
+
+    def _safe_remove_event_handler(self, cli, handler, *, context: str) -> bool:
+        return self._cleanup.remove_event_handler(cli, handler, context=context)
 
     # ---------- session-file compatibility wrappers ----------
     @staticmethod
@@ -229,14 +250,8 @@ class TgClientManager:
             phone = phone if phone.startswith("+") else f"+{phone}"
             return me, phone
         finally:
-            try:
-                await cli.disconnect()
-            except Exception:
-                pass
-            try:
-                cli.session.close()
-            except Exception:
-                pass
+            await self._safe_disconnect(cli, context="inspect_imported_session")
+            self._safe_close_session(cli, context="inspect_imported_session")
 
     async def promote_imported_session(self, session_base: str, phone: str, me: TgUser) -> str:
         dst = self._desired_session_path(
@@ -507,16 +522,14 @@ class TgClientManager:
                 self._action_scheduler.active_actions,
             )
         for cli in list(self._clients.values()):
-            try:
-                await cli.disconnect()
-            except Exception:
-                pass
+            await self._safe_disconnect(cli, context="shutdown:active_client")
         self._service_handlers.clear()
         for pend in list(self._pending.values()):
-            try:
-                await pend['client'].disconnect()
-            except (Exception, asyncio.CancelledError):
-                pass
+            await self._safe_disconnect(
+                pend.get('client'),
+                context="shutdown:pending_phone",
+                suppress_cancelled=True,
+            )
             self._remove_session_files(pend.get('session_path', ''))
         for qr in list(self._qr_pending.values()):
             t = qr.get('wait_task')
@@ -524,10 +537,11 @@ class TgClientManager:
                 t.cancel()
                 with suppress(asyncio.CancelledError):
                     await t
-            try:
-                await qr['client'].disconnect()
-            except (Exception, asyncio.CancelledError):
-                pass
+            await self._safe_disconnect(
+                qr.get('client'),
+                context="shutdown:pending_qr",
+                suppress_cancelled=True,
+            )
             self._remove_session_files(qr.get('session_path', ''))
         self._clients.clear()
         self._pending.clear()
@@ -609,25 +623,25 @@ class TgClientManager:
                     cli.is_user_authorized(), timeout=float(settings.TELEGRAM_AUTH_TIMEOUT)
                 )
             except asyncio.CancelledError:
-                try:
-                    await cli.disconnect()
-                except Exception:
-                    pass
+                await self._safe_disconnect(
+                    cli,
+                    context=f"start_client_cancelled:{acc.id}",
+                )
                 self._clients.pop(acc.id, None)
                 raise
             except Exception as exc:
-                try:
-                    await cli.disconnect()
-                except Exception:
-                    pass
+                await self._safe_disconnect(
+                    cli,
+                    context=f"start_client_failed:{acc.id}",
+                )
                 self._clients.pop(acc.id, None)
                 await self._record_connection_failure(acc.id, exc)
                 raise
             if not authorized:
-                try:
-                    await cli.disconnect()
-                except Exception:
-                    pass
+                await self._safe_disconnect(
+                    cli,
+                    context=f"start_client_unauthorized:{acc.id}",
+                )
                 self._clients.pop(acc.id, None)
                 self._reconnect_exhausted.add(acc.id)
                 await self._set_status(acc.id, "session_revoked")
@@ -669,12 +683,15 @@ class TgClientManager:
                 handler_entry = self._service_handlers.pop(account_id, None)
                 if handler_entry:
                     old_cli, handler = handler_entry
-                    with suppress(Exception):
-                        old_cli.remove_event_handler(handler)
-                try:
-                    await cli.disconnect()
-                except Exception:
-                    pass
+                    self._safe_remove_event_handler(
+                        old_cli,
+                        handler,
+                        context=f"stop_client:{account_id}",
+                    )
+                await self._safe_disconnect(
+                    cli,
+                    context=f"stop_client:{account_id}",
+                )
 
     async def disconnect_account(self, account_id: int):
         """User-requested disconnect; auto-reconnect must not undo it."""
@@ -762,8 +779,11 @@ class TgClientManager:
                 return sent.phone_code_hash
             finally:
                 if not keep:
-                    with suppress(Exception, asyncio.CancelledError):
-                        await cli.disconnect()
+                    await self._safe_disconnect(
+                        cli,
+                        context=f"send_code_cleanup:{phone}",
+                        suppress_cancelled=True,
+                    )
                     self._remove_session_files(session_path)
 
     async def submit_code(self, phone: str, code: str) -> tuple[TgUser | None, bool]:
@@ -793,8 +813,11 @@ class TgClientManager:
         pend['me'] = me
         # Keep the disconnected temp file until the transactional DB/session
         # promotion succeeds; it is bounded by the pending TTL.
-        with suppress(Exception, asyncio.CancelledError):
-            await cli.disconnect()
+        await self._safe_disconnect(
+            cli,
+            context=f"submit_code_complete:{phone}",
+            suppress_cancelled=True,
+        )
         return me, False
 
     async def submit_2fa(self, phone: str, password: str) -> TgUser:
@@ -819,8 +842,11 @@ class TgClientManager:
             )
         pend['authorized'] = True
         pend['me'] = me
-        with suppress(Exception, asyncio.CancelledError):
-            await cli.disconnect()
+        await self._safe_disconnect(
+            cli,
+            context=f"submit_2fa_complete:{phone}",
+            suppress_cancelled=True,
+        )
         return me
 
     async def cancel_pending(self, phone: str):
@@ -839,8 +865,11 @@ class TgClientManager:
     async def _kill_pending(self, phone: str, disconnect: bool = True, remove_session: bool = True):
         pend = self._pending.pop(phone, None)
         if pend and disconnect:
-            with suppress(Exception, asyncio.CancelledError):
-                await pend['client'].disconnect()
+            await self._safe_disconnect(
+                pend.get('client'),
+                context=f"kill_pending:{phone}",
+                suppress_cancelled=True,
+            )
         if pend and remove_session:
             self._remove_session_files(pend.get('session_path', ''))
 
@@ -887,8 +916,11 @@ class TgClientManager:
             keep = True
         finally:
             if not keep:
-                with suppress(Exception, asyncio.CancelledError):
-                    await cli.disconnect()
+                await self._safe_disconnect(
+                    cli,
+                    context=f"qr_start_cleanup:{qr_id}",
+                    suppress_cancelled=True,
+                )
                 self._remove_session_files(sess_path)
         return {
             'qr_id': qr_id,
@@ -909,7 +941,12 @@ class TgClientManager:
                 me = await cli.get_me()
                 entry['me'] = me
                 entry['authorized'] = True
-            except Exception as e:
+            except Exception as exc:
+                log.warning(
+                    "QR login user lookup failed qr_id=%s error=%s",
+                    qr_id,
+                    type(exc).__name__,
+                )
                 entry['error'] = "Could not read Telegram user information"
                 await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
         except SessionPasswordNeededError:
@@ -919,7 +956,12 @@ class TgClientManager:
             await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            log.warning(
+                "QR login wait failed qr_id=%s error=%s",
+                qr_id,
+                type(exc).__name__,
+            )
             entry['error'] = "QR login failed"
             await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
 
@@ -940,8 +982,11 @@ class TgClientManager:
                 await old
         cli: TelegramClient = entry['client']
         if entry.get('closed_at') is not None or not cli.is_connected():
-            with suppress(Exception, asyncio.CancelledError):
-                await cli.disconnect()
+            await self._safe_disconnect(
+                cli,
+                context=f"qr_recreate_closed:{qr_id}",
+                suppress_cancelled=True,
+            )
             self._remove_session_files(entry['session_path'])
             cli = TelegramClient(
                 entry['session_path'], settings.tg_api_id, settings.TG_API_HASH
@@ -951,8 +996,11 @@ class TgClientManager:
                     cli.connect(), timeout=float(settings.TELEGRAM_CONNECT_TIMEOUT)
                 )
             except BaseException:
-                with suppress(Exception, asyncio.CancelledError):
-                    await cli.disconnect()
+                await self._safe_disconnect(
+                    cli,
+                    context=f"qr_recreate_connect_failed:{qr_id}",
+                    suppress_cancelled=True,
+                )
                 self._remove_session_files(entry['session_path'])
                 raise
             entry['client'] = cli
@@ -1044,8 +1092,11 @@ class TgClientManager:
             wait_task.cancel()
             with suppress(asyncio.CancelledError):
                 await wait_task
-        with suppress(Exception, asyncio.CancelledError):
-            await entry['client'].disconnect()
+        await self._safe_disconnect(
+            entry.get('client'),
+            context=f"qr_promote:{qr_id}",
+            suppress_cancelled=True,
+        )
         return entry['session_path']
 
     async def finish_qr(self, qr_id: str, *, remove_session: bool):
@@ -1065,8 +1116,11 @@ class TgClientManager:
             wait_task.cancel()
             with suppress(asyncio.CancelledError):
                 await wait_task
-        with suppress(Exception, asyncio.CancelledError):
-            await entry['client'].disconnect()
+        await self._safe_disconnect(
+            entry.get('client'),
+            context=f"qr_close:{qr_id}",
+            suppress_cancelled=True,
+        )
         self._remove_session_files(entry.get('session_path', ''))
         entry['closed_at'] = entry.get('closed_at') or time.monotonic()
         if remove:
@@ -1083,8 +1137,11 @@ class TgClientManager:
         previous = self._service_handlers.pop(account_id, None)
         if previous:
             old_cli, old_handler = previous
-            with suppress(Exception):
-                old_cli.remove_event_handler(old_handler)
+            self._safe_remove_event_handler(
+                old_cli,
+                old_handler,
+                context=f"replace_listener:{account_id}",
+            )
 
         async def _handler(event):
             try:
@@ -1119,8 +1176,13 @@ class TgClientManager:
                             "message_text": text,
                             "received_at": sm.received_at.isoformat(),
                         })
-                    except Exception:
-                        pass
+                    except Exception as cb_exc:
+                        log.warning(
+                            "new-message subscriber failed account=%s callback=%s error=%s",
+                            account_id,
+                            getattr(cb, "__name__", type(cb).__name__),
+                            type(cb_exc).__name__,
+                        )
             except Exception as e:
                 log.exception("777000 handler failed: %s", e)
         cli.add_event_handler(_handler, events.NewMessage(from_users=SERVICE_ID))
@@ -1236,7 +1298,12 @@ class TgClientManager:
             try:
                 if not cli.is_connected():
                     await self._set_status(aid, "disconnected")
-            except Exception as exc:
+            except (OSError, RuntimeError) as exc:
+                log.debug(
+                    "account=%s connection-state probe failed error=%s",
+                    aid,
+                    type(exc).__name__,
+                )
                 await self._set_status(aid, "disconnected")
                 if self._permanent_status(exc):
                     await self._record_connection_failure(aid, exc)
@@ -1301,7 +1368,12 @@ class TgClientManager:
         for aid, cli in list(self._clients.items()):
             try:
                 ok = cli.is_connected()
-            except Exception:
+            except (OSError, RuntimeError) as exc:
+                log.debug(
+                    "account=%s connection-state read failed error=%s",
+                    aid,
+                    type(exc).__name__,
+                )
                 ok = False
             if ok:
                 connected_ids.append(aid)
@@ -1340,8 +1412,13 @@ class TgClientManager:
                 await self.stop_client(aid)
                 self._last_auth_check[aid] = now
                 continue
-            except Exception:
-                # Transient RPC failure — simply try again on a later slice.
+            except (RPCError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
+                # Transient Telegram/network failure — try again on a later slice.
+                log.debug(
+                    "account=%s authorization verify deferred error=%s",
+                    aid,
+                    type(exc).__name__,
+                )
                 continue
 
             self._last_auth_check[aid] = now
