@@ -47,9 +47,9 @@ Create a sanitized Windows release with `BUILD_RELEASE.bat`.
 
 | Feature | What it does |
 | --- | --- |
-| One-click Windows start | `start.bat` creates the venv, installs the exact lockfile, serves the bundled frontend, and opens the app. |
+| One-click Windows start | `start.bat` creates the venv, installs the exact lockfile, serves the bundled frontend, and opens the app. A source checkout auto-builds the frontend with `npm ci` when needed. |
 | Local-only server | Runs on `127.0.0.1`, so the dashboard is not exposed to the internet. |
-| Telegram sessions | Uses Telethon session files stored inside the backend folder. |
+| Telegram sessions | Uses Telethon session files stored under `data/sessions/`, outside the source tree. |
 | Bulk tools | Bulk names, bios, profile photos, joins, leaves, message actions, and security checks. |
 | Password gate | Dashboard login uses `APP_PASSWORD` and signed cookies. |
 
@@ -86,7 +86,7 @@ To check your new PC setup:
 python --version
 ```
 
-Building from source additionally requires Node.js 20.19+ (or 22.12+).
+Building or running directly from a fresh source checkout additionally requires Node.js 20.19+ (or 22.12+). `START.bat` automatically runs `npm ci` and builds the frontend when `backend/static/index.html` is absent.
 
 ---
 
@@ -96,7 +96,8 @@ Building from source additionally requires Node.js 20.19+ (or 22.12+).
 multi-tg-manager/
   start.bat              -> first-run setup and server launcher
   stop.bat               -> stops the local server on port 8000
-  backend/               -> FastAPI app, SQLite DB, sessions, env
+  backend/               -> FastAPI app, migrations, env, bundled frontend
+  data/                  -> runtime database, sessions, encrypted secrets, backups, logs
   backend/requirements.lock -> exact Python dependency set used by start.bat
   frontend/              -> React and Vite dashboard
   frontend/package.json  -> frontend scripts
@@ -106,7 +107,7 @@ multi-tg-manager/
 
 ## Notes
 
-- `backend/.env`, `backend/app.db`, and `backend/sessions/*.session` are private. Treat session files like passwords.
+- `backend/.env`, `data/database/app.db`, `data/sessions/*.session`, and `data/secrets/twofa.bin` are private. Treat session files like passwords.
 - Close the black server window or run `stop.bat` to stop the app.
 - Only manage accounts you own or are allowed to operate.
 

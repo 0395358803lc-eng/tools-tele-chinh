@@ -142,11 +142,52 @@ if not "!DATA_OK!"=="0" (
   exit /b 1
 )
 
-rem Release mode: START only serves the bundled frontend and never needs Node.js.
+rem Release ZIPs already contain backend\static and therefore need no Node.js.
+rem A source checkout may not contain built assets, so build them deterministically
+rem from package-lock.json when the frontend source tree is available.
 if not exist "!ROOT!\backend\static\index.html" (
-  echo [ERROR] Built frontend is missing. Run BUILD_RELEASE.bat from a development checkout.
-  pause
-  exit /b 1
+  if not exist "!ROOT!\frontend\package.json" (
+    echo [ERROR] Built frontend is missing and no frontend source tree was found.
+    echo Download a release ZIP or restore backend\static before starting.
+    pause
+    exit /b 1
+  )
+  where node >nul 2>nul
+  if errorlevel 1 (
+    echo [ERROR] This is a source checkout and the frontend is not built.
+    echo Install Node.js 20.19+ or 22.12+, then run START.bat again.
+    echo Release ZIP users do not need Node.js.
+    pause
+    exit /b 1
+  )
+  where npm >nul 2>nul
+  if errorlevel 1 (
+    echo [ERROR] npm was not found on PATH.
+    pause
+    exit /b 1
+  )
+  echo [build] Frontend bundle is missing; building from source...
+  pushd "!ROOT!\frontend"
+  call npm ci
+  if errorlevel 1 (
+    popd
+    echo [ERROR] npm ci failed.
+    pause
+    exit /b 1
+  )
+  call npm run build
+  set "FRONTEND_RC=!errorlevel!"
+  popd
+  if not "!FRONTEND_RC!"=="0" (
+    echo [ERROR] Frontend build failed.
+    pause
+    exit /b 1
+  )
+  if not exist "!ROOT!\backend\static\index.html" (
+    echo [ERROR] Frontend build completed without producing backend\static\index.html.
+    pause
+    exit /b 1
+  )
 )
 
 echo.

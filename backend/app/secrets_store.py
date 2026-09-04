@@ -10,12 +10,13 @@ CryptProtectData) using the *current user's* machine scope, then written to:
     <SESSIONS_DIR>/twofa.bin  ->  DPAPI(blob(JSON { "+8801...": "password" }))
 
 DPAPI ties decryption to the Windows account that encrypted it, so the file is
-useless to any other user or machine. On non-Windows platforms the same
-behaviour is emulated with a best-effort obfuscation so the app still works,
-but the real protection is DPAPI on Windows.
+useless to any other user or machine. Secure 2FA storage is intentionally
+Windows-only; startup fails closed when DPAPI is unavailable.
 
-A legacy plaintext `twofa.json` is migrated (encrypted in place, then removed)
-on first startup — see migrate_legacy().
+A legacy plaintext `twofa.json` is migrated into the encrypted store and then
+removed only after a verified round-trip. Older duplicated plaintext copies
+under backend/sessions are removed only when the encrypted store is proven to
+contain the same values.
 """
 from __future__ import annotations
 import asyncio
@@ -26,7 +27,7 @@ import re
 from ctypes import wintypes
 from pathlib import Path
 
-from .config import settings
+from .config import PROJECT_ROOT, settings
 
 _lock = asyncio.Lock()
 
@@ -130,6 +131,34 @@ def legacy_path() -> Path:
     return settings.secrets_path / "twofa.json"
 
 
+def _legacy_backend_plaintext_path() -> Path:
+    return PROJECT_ROOT / "backend" / "sessions" / "twofa.json"
+
+
+def _clean_mapping(obj) -> dict[str, str]:
+    if not isinstance(obj, dict):
+        raise RuntimeError("Legacy 2FA store has an invalid payload")
+    return {str(k): str(v) for k, v in obj.items()}
+
+
+def _remove_legacy_plaintext_if_covered(secure_data: dict[str, str]) -> bool:
+    """Delete an old backend/sessions/twofa.json only when every stored value
+    is already present in the verified encrypted store. Mismatches are kept so
+    a stale/partial secure store can never destroy the user's only password copy.
+    """
+    legacy = _legacy_backend_plaintext_path()
+    if not legacy.exists():
+        return False
+    try:
+        old_data = _clean_mapping(json.loads(legacy.read_text(encoding="utf-8") or "{}"))
+    except Exception:
+        return False
+    if not all(secure_data.get(key) == value for key, value in old_data.items()):
+        return False
+    legacy.unlink(missing_ok=True)
+    return True
+
+
 def _norm_phone(phone: str) -> str:
     p = (phone or "").strip()
     if not p:
@@ -184,27 +213,43 @@ def _write(data: dict[str, str]):
 
 
 async def migrate_legacy():
-    """Encrypt a legacy plaintext twofa.json in place, verify the round-trip,
-    then delete the plaintext file. No-op when there's nothing to migrate."""
+    """Migrate plaintext 2FA data without ever deleting an uncovered value.
+
+    New installs normally have at most data/secrets/twofa.json because config
+    moves the legacy file there instead of copying it. Older builds may also
+    have left backend/sessions/twofa.json behind; that duplicate is cleaned only
+    after the encrypted store has been written and verified.
+    """
     src = legacy_path()
-    if not src.exists():
-        return
     try:
+        existing: dict[str, str] = {}
         if _path().exists():
-            _read()  # refuse to overwrite an existing unreadable store
-        data = json.loads(src.read_text(encoding="utf-8") or "{}")
-        if not isinstance(data, dict):
-            data = {}
-        clean = {str(k): str(v) for k, v in data.items()}
-        async with _lock:
-            _write(clean)
-            # verify we can read it back before removing the source
-            back = _read()
-            if set(back.keys()) == set(clean.keys()):
-                src.unlink(missing_ok=True)
+            existing = _read()  # refuse to overwrite an unreadable secure store
+
+        if src.exists():
+            incoming = _clean_mapping(json.loads(src.read_text(encoding="utf-8") or "{}"))
+            # Existing encrypted values win over stale legacy values for the same
+            # phone, while legacy-only entries are preserved. If the two stores
+            # disagree for a phone, keep the plaintext source after the merge:
+            # that conflicting value is not proven to exist in the secure store.
+            conflicts = {
+                key for key, value in incoming.items()
+                if key in existing and existing[key] != value
+            }
+            merged = {**incoming, **existing}
+            async with _lock:
+                _write(merged)
+                back = _read()
+                if back == merged and not conflicts:
+                    src.unlink(missing_ok=True)
+                    _remove_legacy_plaintext_if_covered(back)
+        elif existing:
+            # Upgrade path for users who already migrated data/secrets/twofa.json
+            # with an older build but still have the duplicated backend copy.
+            _remove_legacy_plaintext_if_covered(existing)
     except Exception:
-        # Leave the legacy file in place if migration fails — safer than losing
-        # the only copy of the user's passwords.
+        # Leave every plaintext source in place on any ambiguity/failure. Data
+        # retention is safer than deleting the user's only usable 2FA password.
         pass
 
 
