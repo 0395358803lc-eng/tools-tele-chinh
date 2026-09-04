@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import logging
-import sqlite3
 import secrets
 import time
 from datetime import datetime
@@ -26,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .config import settings
 from .account_scheduler import AccountActionScheduler
+from .client_cleanup import TelegramClientCleanup
 from .session_files import SessionFileStore
 from .db import AsyncSessionLocal
 from .models import Account, AppSetting, SecurityMessage, GoneAccount
@@ -89,6 +89,7 @@ class TgClientManager:
         # Lifecycle locks above still protect client creation/removal, while the
         # scheduler serializes mutations per account and handles FloodWait/pacing.
         self._action_scheduler = AccountActionScheduler(log)
+        self._cleanup = TelegramClientCleanup(log)
         self._session_files = SessionFileStore(log)
         self.auto_reconnect = True
         self._reconnect_attempts: dict[int, int] = {}
@@ -147,82 +148,17 @@ class TgClientManager:
         context: str,
         suppress_cancelled: bool = False,
     ) -> bool:
-        """Best-effort Telegram cleanup with diagnostics.
+        return await self._cleanup.disconnect(
+            cli,
+            context=context,
+            suppress_cancelled=suppress_cancelled,
+        )
 
-        Expected transport/session-close failures never break cleanup. Unexpected
-        exceptions are still contained at this cleanup boundary, but are logged
-        instead of disappearing silently. Cancellation propagation matches the
-        caller's requested semantics.
-        """
-        if cli is None:
-            return True
-        try:
-            await cli.disconnect()
-            return True
-        except asyncio.CancelledError:
-            if suppress_cancelled:
-                log.debug("Telegram disconnect cancelled context=%s", context)
-                return False
-            raise
-        except (RPCError, ConnectionError, OSError, RuntimeError) as exc:
-            log.debug(
-                "Telegram disconnect cleanup failed context=%s error=%s",
-                context,
-                type(exc).__name__,
-            )
-            return False
-        except Exception as exc:
-            log.warning(
-                "unexpected Telegram disconnect cleanup failure context=%s error=%s",
-                context,
-                type(exc).__name__,
-            )
-            return False
+    def _safe_close_session(self, cli, *, context: str) -> bool:
+        return self._cleanup.close_session(cli, context=context)
 
-    @staticmethod
-    def _safe_close_session(cli, *, context: str) -> bool:
-        """Close Telethon's local session handle without hiding diagnostics."""
-        session = getattr(cli, "session", None)
-        if session is None:
-            return True
-        try:
-            session.close()
-            return True
-        except (sqlite3.Error, OSError, RuntimeError) as exc:
-            log.debug(
-                "Telegram session close failed context=%s error=%s",
-                context,
-                type(exc).__name__,
-            )
-            return False
-        except Exception as exc:
-            log.warning(
-                "unexpected Telegram session close failure context=%s error=%s",
-                context,
-                type(exc).__name__,
-            )
-            return False
-
-    @staticmethod
-    def _safe_remove_event_handler(cli, handler, *, context: str) -> bool:
-        """Detach a Telethon callback without allowing cleanup to abort lifecycle."""
-        try:
-            cli.remove_event_handler(handler)
-            return True
-        except (OSError, RuntimeError) as exc:
-            log.debug(
-                "Telegram handler detach failed context=%s error=%s",
-                context,
-                type(exc).__name__,
-            )
-            return False
-        except Exception as exc:
-            log.warning(
-                "unexpected Telegram handler detach failure context=%s error=%s",
-                context,
-                type(exc).__name__,
-            )
-            return False
+    def _safe_remove_event_handler(self, cli, handler, *, context: str) -> bool:
+        return self._cleanup.remove_event_handler(cli, handler, context=context)
 
     # ---------- session-file compatibility wrappers ----------
     @staticmethod
