@@ -414,7 +414,7 @@ class TgClientManager:
                             for base in self._session_path_candidates(acc):
                                 try:
                                     candidate_paths.append(str(Path(base + ".session").resolve()).lower())
-                                except Exception:
+                                except (OSError, RuntimeError):
                                     pass
                             has_existing_file = any(Path(base + ".session").exists() for base in self._session_path_candidates(acc))
                             if resolved not in candidate_paths and has_existing_file:
