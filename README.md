@@ -33,8 +33,22 @@ Run automated tests with:
 ```powershell
 cd backend
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+cd ..\frontend
+npm test
+npm run build
 ```
 
+Run endurance checks from the project root:
+
+```powershell
+# Scheduler stress test; does not contact Telegram.
+SOAK_TEST.bat -Mode scheduler -Minutes 5 -Accounts 100
+
+# Poll a running app's health/database/secure-store state over time.
+SOAK_TEST.bat -Mode health -Minutes 30 -IntervalSeconds 2
+```
+
+The health soak requires Multi TG Manager to already be running on `127.0.0.1:8000`.
 Create a sanitized Windows release with `BUILD_RELEASE.bat`.
 
 <div align="center">

@@ -24,6 +24,8 @@ try {
     if (Test-Path "node_modules") { Remove-Item -LiteralPath "node_modules" -Recurse -Force }
     & npm.cmd ci
     if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
+    & npm.cmd test
+    if ($LASTEXITCODE -ne 0) { throw "Frontend regression tests failed" }
     & npm.cmd audit --audit-level=high
     if ($LASTEXITCODE -ne 0) { throw "npm audit found a high/critical vulnerability" }
     & npm.cmd run build
@@ -57,6 +59,7 @@ foreach ($Name in $OptionalRootFiles) {
     }
 }
 Copy-Item (Join-Path $Root "backend\restore_backup.py") (Join-Path $Target "backend\restore_backup.py")
+Copy-Item (Join-Path $Root "backend\soak_scheduler.py") (Join-Path $Target "backend\soak_scheduler.py")
 Copy-Item (Join-Path $Root "README.md") (Join-Path $Target "README.md")
 Copy-Item (Join-Path $Root "LICENSE") (Join-Path $Target "LICENSE")
 Copy-Item (Join-Path $Root "backend\check_requirements.py") (Join-Path $Target "backend\check_requirements.py")
