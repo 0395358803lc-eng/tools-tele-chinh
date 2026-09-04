@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import QRCode from 'qrcode'
 import { Endpoints } from '../lib/api'
+import { rowText } from '../lib/err'
 import { useToast } from '../lib/toast.jsx'
 
 export default function AddAccountModal({ onClose, onAdded, onImported }) {
+  const { t } = useTranslation()
   const toast = useToast()
   const [method, setMethod] = useState('phone') // 'phone' | 'qr' | 'session'
 
@@ -39,13 +42,13 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
   // ---------- Phone flow ----------
   async function sendCode() {
     if (!phone.startsWith('+')) {
-      toast.error('Enter phone with country code, e.g. +8801712345678')
+      toast.error(t('addAccount.phoneFormatError'))
       return
     }
-    setBusy(true); setHint('Sending code via Telegram... up to 30 seconds')
+    setBusy(true); setHint(t('addAccount.sendingCode'))
     try {
       await Endpoints.sendCode(phone)
-      toast.info('Code sent. Check Telegram.')
+      toast.info(t('addAccount.codeSent'))
       setHint('')
       setStep(2)
     } catch (e) { toast.error(e.message); setHint('') } finally { setBusy(false) }
@@ -53,15 +56,15 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
 
   async function submitCode() {
     if (!code) return
-    setBusy(true); setHint('Verifying code...')
+    setBusy(true); setHint(t('addAccount.verifyingCode'))
     try {
       const r = await Endpoints.signIn(phone, code)
       if (r?.needs_2fa) {
-        toast.info('2FA password required')
+        toast.info(t('addAccount.twoFaRequired'))
         setHint('')
         setStep(3)
       } else {
-        toast.success('Account added!')
+        toast.success(t('addAccount.accountAdded'))
         onAdded?.()
       }
     } catch (e) {
@@ -74,10 +77,10 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
 
   async function submit2fa() {
     if (!pwd) return
-    setBusy(true); setHint('Submitting 2FA password...')
+    setBusy(true); setHint(t('addAccount.submitting2fa'))
     try {
       await Endpoints.signIn2fa(phone, pwd)
-      toast.success('Account added with 2FA!')
+      toast.success(t('addAccount.accountAdded2fa'))
       onAdded?.()
     } catch (e) {
       toast.error(e.message)
@@ -143,7 +146,7 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
         if (s === 'authorized') {
           stopPolling()
           setQrState('authorized')
-          toast.success('Account added via QR!')
+          toast.success(t('addAccount.accountAddedQr'))
           onAdded?.()
         } else if (s === 'needs_2fa') {
           stopPolling()
@@ -154,7 +157,7 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
         } else if (s === 'error') {
           stopPolling()
           setQrState('error')
-          setQrError(r?.error || 'Telegram returned an error')
+          setQrError(r?.error || t('addAccount.telegramError'))
         }
       } catch (e) {
         // network errors during poll: keep trying, but surface persistent failures
@@ -164,11 +167,11 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
 
   async function submitQr2fa() {
     if (!qr2faPwd || !qrIdRef.current) return
-    setBusy(true); setHint('Submitting 2FA password...')
+    setBusy(true); setHint(t('addAccount.submitting2fa'))
     try {
       const r = await Endpoints.qrSignIn2fa(qrIdRef.current, qr2faPwd)
       if (r?.state === 'authorized') {
-        toast.success('Account added with 2FA!')
+        toast.success(t('addAccount.accountAdded2fa'))
         onAdded?.()
       }
     } catch (e) {
@@ -186,22 +189,22 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
 
   async function importSessionFiles() {
     if (sessionFiles.length === 0) {
-      toast.error('Choose at least one .session file')
+      toast.error(t('addAccount.pickSessionsError'))
       return
     }
     setBusy(true)
-    setHint(`Importing ${sessionFiles.length} session file${sessionFiles.length === 1 ? '' : 's'}...`)
+    setHint(t('addAccount.importingSessions', { count: sessionFiles.length }))
     setSessionResult(null)
     try {
       const r = await Endpoints.importSessions(sessionFiles)
       setSessionResult(r)
       if ((r.success || 0) > 0) {
-        toast.success(`Imported ${r.success} account${r.success === 1 ? '' : 's'}`)
+        toast.success(t('addAccount.importedAccounts', { count: r.success }))
         onImported?.()
       }
       const needsAttention = (r.failed || 0) + (r.skipped || 0)
       if (needsAttention > 0) {
-        toast.info(`${needsAttention} session file${needsAttention === 1 ? '' : 's'} need attention`)
+        toast.info(t('addAccount.needAttention', { count: needsAttention }))
       }
     } catch (e) {
       toast.error(e.message)
@@ -213,20 +216,20 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
 
   async function scanSessionsFolder() {
     setBusy(true)
-    setHint('Scanning sessions folder...')
+    setHint(t('addAccount.scanningFolder'))
     setSessionResult(null)
     try {
       const r = await Endpoints.syncSessionsFolder()
       setSessionResult(r)
       if ((r.success || 0) > 0) {
-        toast.success(`Added ${r.success} pasted session${r.success === 1 ? '' : 's'}`)
+        toast.success(t('addAccount.addedSessions', { count: r.success }))
         onImported?.()
       } else if ((r.failed || 0) === 0) {
-        toast.info('No new pasted sessions found')
+        toast.info(t('addAccount.noNewSessions'))
       }
       const needsAttention = (r.failed || 0) + (r.skipped || 0)
       if (needsAttention > 0) {
-        toast.info(`${needsAttention} session file${needsAttention === 1 ? '' : 's'} reported`)
+        toast.info(t('addAccount.reportedSessions', { count: needsAttention }))
       }
     } catch (e) {
       toast.error(e.message)
@@ -256,7 +259,7 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
       <div className="nb-card p-6 w-full max-w-2xl max-h-[90vh] overflow-auto" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="font-extrabold uppercase tracking-tight text-xl">
-            Add Account {step === 3 && method === 'phone' && <span className="nb-badge bg-brand-violet text-black ml-2">2FA</span>}
+            {t('addAccount.title')} {step === 3 && method === 'phone' && <span className="nb-badge bg-brand-violet text-black ml-2">2FA</span>}
             {method === 'qr' && qrState === 'needs_2fa' && <span className="nb-badge bg-brand-violet text-black ml-2">2FA</span>}
           </h2>
           <button className="nb-btn !py-1 !px-2" onClick={close}>✕</button>
@@ -266,53 +269,53 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
           <button
             className={`nb-tab flex-1 ${method === 'phone' ? 'nb-tab-active' : ''}`}
             onClick={() => setMethod('phone')}
-          >Phone</button>
+          >{t('addAccount.tabPhone')}</button>
           <button
             className={`nb-tab flex-1 ${method === 'qr' ? 'nb-tab-active' : ''}`}
             onClick={() => setMethod('qr')}
-          >QR Code</button>
+          >{t('addAccount.tabQr')}</button>
           <button
             className={`nb-tab flex-1 ${method === 'session' ? 'nb-tab-active' : ''}`}
             onClick={() => setMethod('session')}
-          >Session Files</button>
+          >{t('addAccount.tabSession')}</button>
         </div>
 
         {method === 'phone' && step === 1 && (
           <div className="space-y-3">
             <label className="block">
-              <div className="text-xs font-bold uppercase mb-1">Phone (with country code)</div>
+              <div className="text-xs font-bold uppercase mb-1">{t('addAccount.phoneLabel')}</div>
               <input
                 className="nb-input"
                 value={phone}
                 onChange={(e) => setPhone(e.target.value)}
-                placeholder="+8801712345678"
+                placeholder={t('addAccount.phonePlaceholder')}
                 autoFocus
                 onKeyDown={(e) => { if (e.key === 'Enter') sendCode() }}
               />
             </label>
             <button className="nb-btn-pri w-full" disabled={busy} onClick={sendCode}>
-              {busy ? 'Sending…' : 'Send Code'}
+              {busy ? t('addAccount.sendCodeBusy') : t('addAccount.sendCode')}
             </button>
           </div>
         )}
 
         {method === 'phone' && step === 2 && (
           <div className="space-y-3">
-            <div className="text-sm">OTP sent to <span className="font-mono">{phone}</span></div>
+            <div className="text-sm">{t('addAccount.otpSent')} <span className="font-mono">{phone}</span></div>
             <input
               className="nb-input"
               value={code}
               onChange={(e) => setCode(e.target.value)}
-              placeholder="Login code"
+              placeholder={t('addAccount.codePlaceholder')}
               autoFocus
               inputMode="numeric"
               onKeyDown={(e) => { if (e.key === 'Enter') submitCode() }}
             />
             <button className="nb-btn-pri w-full" disabled={busy || !code} onClick={submitCode}>
-              {busy ? 'Verifying…' : 'Verify Code'}
+              {busy ? t('addAccount.verifying') : t('addAccount.verifyCode')}
             </button>
             <button className="nb-btn w-full" disabled={busy} onClick={() => setStep(1)}>
-              Back / Resend
+              {t('addAccount.backResend')}
             </button>
           </div>
         )}
@@ -320,22 +323,22 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
         {method === 'phone' && step === 3 && (
           <div className="space-y-3">
             <div className="nb-card-sm p-3 bg-brand-violet text-black text-sm font-bold">
-              2FA enabled. Enter your Two-Step password for <span className="font-mono">{phone}</span>
+              {t('addAccount.twoFaEnabled')} <span className="font-mono">{phone}</span>
             </div>
             <input
               type="password"
               className="nb-input"
               value={pwd}
               onChange={(e) => setPwd(e.target.value)}
-              placeholder="Telegram 2FA password"
+              placeholder={t('addAccount.telegram2faPwd')}
               autoFocus
               onKeyDown={(e) => { if (e.key === 'Enter') submit2fa() }}
             />
             <button className="nb-btn-pri w-full" disabled={busy || !pwd} onClick={submit2fa}>
-              {busy ? 'Submitting…' : 'Submit 2FA'}
+              {busy ? t('addAccount.submitting') : t('addAccount.submit2fa')}
             </button>
             <div className="text-[10px] opacity-60">
-              Wrong password? You can retry without re-sending the code.
+              {t('addAccount.twoFaRetryHint')}
             </div>
           </div>
         )}
@@ -343,35 +346,35 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
         {method === 'qr' && qrState !== 'needs_2fa' && (
           <div className="space-y-3">
             <ol className="text-xs space-y-1 opacity-80 list-decimal pl-4">
-              <li>Open Telegram on your phone</li>
-              <li>Go to <b>Settings → Devices → Link Desktop Device</b></li>
-              <li>Scan the code below</li>
+              <li>{t('addAccount.qrStep1')}</li>
+              <li>{t('addAccount.qrStep2')}</li>
+              <li>{t('addAccount.qrStep3')}</li>
             </ol>
 
             <div className="flex items-center justify-center bg-white rounded p-3 border-2 border-black min-h-[280px]">
               {qrImg ? (
-                <img src={qrImg} alt="Telegram QR" width="260" height="260" />
+                <img src={qrImg} alt={t('addAccount.tabQr')} width="260" height="260" />
               ) : (
-                <div className="text-xs opacity-60">{busy ? 'Generating QR…' : 'No code yet'}</div>
+                <div className="text-xs opacity-60">{busy ? t('addAccount.generatingQr') : t('addAccount.noCodeYet')}</div>
               )}
             </div>
 
             {qrState === 'waiting' && (
-              <div className="text-xs opacity-70 text-center">Waiting for scan…</div>
+              <div className="text-xs opacity-70 text-center">{t('addAccount.waitingScan')}</div>
             )}
             {qrState === 'expired' && (
               <div className="nb-card-sm p-2 bg-yellow-200 text-black text-xs font-bold text-center">
-                QR expired. Tap Refresh to get a new code.
+                {t('addAccount.qrExpired')}
               </div>
             )}
             {qrState === 'error' && (
               <div className="nb-card-sm p-2 bg-red-300 text-black text-xs font-bold">
-                {qrError || 'Something went wrong'}
+                {qrError || t('addAccount.somethingWrong')}
               </div>
             )}
 
             <button className="nb-btn w-full" disabled={busy} onClick={refreshQr}>
-              {busy ? 'Working…' : 'Refresh Code'}
+              {busy ? t('addAccount.working') : t('addAccount.refreshCode')}
             </button>
           </div>
         )}
@@ -379,19 +382,19 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
         {method === 'qr' && qrState === 'needs_2fa' && (
           <div className="space-y-3">
             <div className="nb-card-sm p-3 bg-brand-violet text-black text-sm font-bold">
-              QR scanned. This account has 2FA — enter your Two-Step password.
+              {t('addAccount.qrNeeds2fa')}
             </div>
             <input
               type="password"
               className="nb-input"
               value={qr2faPwd}
               onChange={(e) => setQr2faPwd(e.target.value)}
-              placeholder="Telegram 2FA password"
+              placeholder={t('addAccount.telegram2faPwd')}
               autoFocus
               onKeyDown={(e) => { if (e.key === 'Enter') submitQr2fa() }}
             />
             <button className="nb-btn-pri w-full" disabled={busy || !qr2faPwd} onClick={submitQr2fa}>
-              {busy ? 'Submitting…' : 'Submit 2FA'}
+              {busy ? t('addAccount.submitting') : t('addAccount.submit2fa')}
             </button>
           </div>
         )}
@@ -399,11 +402,11 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
         {method === 'session' && (
           <div className="space-y-3">
             <div className="text-sm opacity-80">
-              Import one or more Telethon <span className="font-mono">.session</span> files, or paste them into the sessions folder and scan. If one file fails, the rest will still be imported.
+              {t('addAccount.sessionIntro')}
             </div>
 
             <label className="block">
-              <div className="text-xs font-bold uppercase mb-1">Session files</div>
+              <div className="text-xs font-bold uppercase mb-1">{t('addAccount.sessionFilesLabel')}</div>
               <input
                 type="file"
                 className="nb-input"
@@ -426,31 +429,31 @@ export default function AddAccountModal({ onClose, onAdded, onImported }) {
             )}
 
             <button className="nb-btn-pri w-full" disabled={busy || sessionFiles.length === 0} onClick={importSessionFiles}>
-              {busy ? 'Importing...' : `Import ${sessionFiles.length || ''} Session File${sessionFiles.length === 1 ? '' : 's'}`}
+              {busy ? t('addAccount.importingSessions', { count: sessionFiles.length }) : t('addAccount.importBtn', { count: sessionFiles.length })}
             </button>
 
             <button className="nb-btn-info w-full" disabled={busy} onClick={scanSessionsFolder}>
-              Scan Pasted Sessions Folder
+              {t('addAccount.scanFolder')}
             </button>
 
             {sessionResult && (
               <div className="space-y-2">
                 <div className="flex gap-2 flex-wrap">
-                  <span className="nb-badge bg-brand-ok text-black">{sessionResult.success || 0} imported</span>
-                  <span className="nb-badge bg-brand-err text-black">{sessionResult.failed || 0} failed</span>
-                  <span className="nb-badge bg-brand-warn text-black">{sessionResult.skipped || 0} skipped</span>
+                  <span className="nb-badge bg-brand-ok text-black">{t('addAccount.importedBadge', { count: sessionResult.success || 0 })}</span>
+                  <span className="nb-badge bg-brand-err text-black">{t('addAccount.failedBadge', { count: sessionResult.failed || 0 })}</span>
+                  <span className="nb-badge bg-brand-warn text-black">{t('addAccount.skippedBadge', { count: sessionResult.skipped || 0 })}</span>
                 </div>
                 <div className="space-y-1 max-h-64 overflow-auto">
                   {(sessionResult.results || []).map((r, i) => (
                     <div key={`${r.filename}-${i}`} className="nb-card-sm p-2 text-sm flex items-center gap-2">
                       <span className={'nb-badge text-black ' + (r.status === 'ok' ? 'bg-brand-ok' : r.status === 'skipped' ? 'bg-brand-warn' : 'bg-brand-err')}>
-                        {r.status}
+                        {t(r.status === 'ok' ? 'progress.statusOk' : r.status === 'skipped' ? 'progress.statusSkipped' : 'progress.statusFailed')}
                       </span>
                       <div className="min-w-0 flex-1">
                         <div className="font-bold truncate">{r.name || r.phone || r.filename}</div>
                         <div className="font-mono text-[11px] opacity-70 truncate">{r.filename}{r.phone ? ` - ${r.phone}` : ''}</div>
                       </div>
-                      {r.detail && <div className="text-xs opacity-75 max-w-[45%] truncate" title={r.detail}>{r.detail}</div>}
+                      {rowText(r) && <div className="text-xs opacity-75 max-w-[45%] truncate" title={rowText(r)}>{rowText(r)}</div>}
                     </div>
                   ))}
                 </div>

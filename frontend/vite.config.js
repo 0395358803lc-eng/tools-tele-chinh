@@ -7,7 +7,7 @@ export default defineConfig({
   // When building, output straight into backend/static so a single FastAPI
   // process can serve both API and UI.
   build: {
-    outDir: path.resolve(__dirname, '../backend/static'),
+    outDir: path.resolve(import.meta.dirname, '../backend/static'),
     emptyOutDir: true,
   },
   server: {

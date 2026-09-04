@@ -13,7 +13,7 @@ from ..models import SecurityMessage, Account
 from ..schemas import SecurityMessageOut, TgSessionOut, Bulk2faIn
 from ..tg_manager import manager
 from .. import secrets_store
-from ..utils import bulk_stream
+from ..utils import bulk_stream, friendly_error, ok_result
 
 router = APIRouter(prefix="/api/security", tags=["security"])
 
@@ -59,23 +59,26 @@ async def backfill(account_id: int, limit: int = 50):
     try:
         await manager._backfill_777000(account_id, cli, limit=min(max(limit, 1), 200))
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, friendly_error(e))
     return {"ok": True}
 
 
 @router.get("/twofa_known")
 async def twofa_known():
     """How many saved 2FA passwords we have locally (used to seed bulk change)."""
-    try:
-        return {"count": await secrets_store.count()}
-    except Exception:
-        return {"count": 0}
+    return {"count": await secrets_store.count()}
+
+
+@router.delete("/twofa_known")
+async def clear_saved_twofa():
+    await secrets_store.clear_all()
+    return {"ok": True, "count": 0}
 
 
 def _is_wrong_password(e: Exception) -> bool:
     if isinstance(e, PasswordHashInvalidError):
         return True
-    return "PASSWORD_HASH_INVALID" in str(e).upper()
+    return type(e).__name__ == "PasswordHashInvalidError"
 
 
 @router.post("/bulk_2fa")
@@ -86,7 +89,7 @@ async def bulk_2fa(body: Bulk2faIn, db: AsyncSession = Depends(get_db)):
     each account's remembered password first, then up to the provided bank — at
     most 5 attempts per account — until one is accepted, then set the new one.
     """
-    new_password = (body.new_password or "").strip()
+    new_password = body.new_password or ""
     if not new_password:
         raise HTTPException(400, "New password is required")
     hint = (body.hint or "")[:20]
@@ -97,7 +100,9 @@ async def bulk_2fa(body: Bulk2faIn, db: AsyncSession = Depends(get_db)):
         for a in res.scalars().all()
     ]
     phone_by_id = {a[0]: a[1] for a in accounts}
-    bank = [p.strip() for p in (body.password_bank or []) if p and p.strip()]
+    # Telegram passwords are opaque strings: surrounding whitespace may be
+    # intentional and must never be normalized away.
+    bank = [p for p in (body.password_bank or []) if p]
 
     async def _set_has_2fa(account_id: int):
         async with AsyncSessionLocal() as s:
@@ -106,14 +111,14 @@ async def bulk_2fa(body: Bulk2faIn, db: AsyncSession = Depends(get_db)):
                 acc.has_2fa = True
                 await s.commit()
 
-    async def _save_warn(phone: str) -> str:
+    async def _save_warn(phone: str):
         """Persist the new password, but never let a save failure mask the fact
-        that Telegram already accepted the change. Returns a warning suffix."""
+        that Telegram already accepted the change. Returns a warning flag."""
         try:
             await secrets_store.save_2fa(phone, new_password)
-            return ""
+            return False
         except Exception:
-            return " — note: password changed but couldn't be saved locally"
+            return True
 
     async def _change(cli, aid):
         phone = phone_by_id.get(aid, "")
@@ -123,7 +128,7 @@ async def bulk_2fa(body: Bulk2faIn, db: AsyncSession = Depends(get_db)):
             await cli.edit_2fa(new_password=new_password, hint=hint)
             warn = await _save_warn(phone)
             await _set_has_2fa(aid)
-            return "ok", "2FA set (was off)" + warn
+            return ok_result("security.set2faSaveFailed" if warn else "security.set2fa")
 
         # Build the candidate bank: remembered password first, then provided ones.
         saved = await secrets_store.get_2fa(phone)
@@ -145,7 +150,8 @@ async def bulk_2fa(body: Bulk2faIn, db: AsyncSession = Depends(get_db)):
                 await cli.edit_2fa(current_password=cand, new_password=new_password, hint=hint)
                 warn = await _save_warn(phone)
                 await _set_has_2fa(aid)
-                return "ok", f"changed (try {tried})" + warn
+                key = "security.changed2faSaveFailed" if warn else "security.changed2fa"
+                return ok_result(key, {"tried": tried})
             except FloodWaitError:
                 raise  # surfaced as a clear "wait Ns" message; don't keep hammering
             except Exception as e:
@@ -184,10 +190,8 @@ async def terminate_others_all(db: AsyncSession = Depends(get_db)):
 
     async def _terminate(cli, aid):
         killed, failed = await _terminate_other_authorizations(cli)
-        detail = "no other sessions" if killed == 0 else f"terminated {killed}"
-        if failed:
-            detail += f", {failed} failed"
-        return "ok", detail
+        return ok_result("security.terminatedSessions",
+                         {"killed": killed, "failed": failed})
 
     return StreamingResponse(
         bulk_stream(accounts, _terminate),
@@ -222,9 +226,13 @@ async def terminate_session(account_id: int, hash_id: int):
     if not cli:
         raise HTTPException(409, "Account not connected")
     try:
-        await cli(ResetAuthorizationRequest(hash=hash_id))
+        await manager.run_account_action(
+            account_id,
+            lambda: cli(ResetAuthorizationRequest(hash=hash_id)),
+            operation="terminate_session",
+        )
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, friendly_error(e))
     return {"ok": True}
 
 
@@ -234,7 +242,11 @@ async def terminate_others(account_id: int):
     if not cli:
         raise HTTPException(409, "Account not connected")
     try:
-        killed, _failed = await _terminate_other_authorizations(cli)
+        killed, _failed = await manager.run_account_action(
+            account_id,
+            lambda: _terminate_other_authorizations(cli),
+            operation="terminate_other_sessions",
+        )
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, friendly_error(e))
     return {"ok": True, "terminated": killed}

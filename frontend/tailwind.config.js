@@ -5,8 +5,8 @@ export default {
   theme: {
     extend: {
       fontFamily: {
-        mono: ['JetBrains Mono', 'IBM Plex Mono', 'monospace'],
-        sans: ['Inter', 'system-ui', 'sans-serif'],
+        mono: ['Cascadia Mono', 'Consolas', 'monospace'],
+        sans: ['Segoe UI', 'Arial', 'sans-serif'],
       },
       boxShadow: {
         nb: '4px 4px 0 0 rgba(0,0,0,1)',

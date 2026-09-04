@@ -11,7 +11,8 @@ from ..db import get_db, AsyncSessionLocal
 from ..models import Account
 from ..schemas import BulkProfileIn
 from ..tg_manager import manager
-from ..utils import bulk_stream
+from ..utils import bulk_stream, ok_result, skipped_result
+from ..uploads import ensure_image_upload, read_limited, sanitize_filename, validate_image_bytes, IMAGE_MAX_BYTES
 
 router = APIRouter(prefix="/api/bulk", tags=["bulk"])
 
@@ -75,8 +76,7 @@ async def bulk_profile(body: BulkProfileIn, db: AsyncSession = Depends(get_db)):
         kw = plan.get(aid) or {}
         uname = uname_plan.get(aid)
         if not kw and not uname:
-            return "ok", "nothing to change"
-        detail: list[str] = []
+            return ok_result("bulk.nothingToChange")
 
         # 1) name / bio (single UpdateProfile call)
         if kw:
@@ -87,14 +87,14 @@ async def bulk_profile(body: BulkProfileIn, db: AsyncSession = Depends(get_db)):
         # 2) username (separate call; may fail per-account — taken/invalid surface
         #    as a failed row via friendly_error, "unchanged" counts as success).
         username_set = None
+        username_unchanged = False
         if uname:
             try:
                 await cli(UpdateUsernameRequest(username=uname))
                 username_set = uname
-                detail.append(f"@{uname}")
             except UsernameNotModifiedError:
                 username_set = uname
-                detail.append(f"@{uname} (unchanged)")
+                username_unchanged = True
 
         # persist whatever actually changed
         if kw or username_set:
@@ -106,7 +106,10 @@ async def bulk_profile(body: BulkProfileIn, db: AsyncSession = Depends(get_db)):
                     if "about" in kw: acc.bio = kw["about"]
                     if username_set is not None: acc.username = username_set
                     await s.commit()
-        return "ok", ", ".join(detail)
+        if username_set:
+            key = "bulk.usernameUnchanged" if username_unchanged else "bulk.usernameSet"
+            return ok_result(key, {"username": username_set})
+        return ok_result("bulk.profileUpdated")
 
     return StreamingResponse(bulk_stream(accounts, _do), media_type="application/x-ndjson")
 
@@ -128,11 +131,19 @@ async def bulk_photo(
 
     # write all uploads to disk first; map account-index -> temp path
     tmp_paths: list[str] = []
-    for f in files:
-        data = await f.read()
-        suffix = os.path.splitext(f.filename or "photo.jpg")[1] or ".jpg"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(data); tmp_paths.append(tmp.name)
+    try:
+        for f in files:
+            ensure_image_upload(f)
+            data = await read_limited(f, IMAGE_MAX_BYTES)
+            validate_image_bytes(data)
+            suffix = os.path.splitext(sanitize_filename(f.filename))[1] or ".jpg"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(data); tmp_paths.append(tmp.name)
+    except Exception:
+        for p in tmp_paths:
+            try: os.unlink(p)
+            except Exception: pass
+        raise
 
     path_by_id: dict[int, str | None] = {}
     for idx, acc in enumerate(ordered):
@@ -146,10 +157,10 @@ async def bulk_photo(
     async def _do(cli, aid):
         path = path_by_id.get(aid)
         if not path:
-            return "skipped", "no photo for this account"
+            return skipped_result("bulk.noPhoto")
         up = await cli.upload_file(path)
         await cli(UploadProfilePhotoRequest(file=up))
-        return "ok", ""
+        return ok_result("bulk.photoApplied")
 
     async def _gen():
         try:

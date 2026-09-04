@@ -2,6 +2,7 @@ import { useState, useCallback } from 'react'
 
 const EMPTY = {
   title: '', total: 0, current: 0,
+  created: 0,
   success: 0, failed: 0, skipped: 0, pending: 0,
   currentName: '', rows: [], done: false, error: null,
 }
@@ -22,7 +23,12 @@ export function useBulkProgress() {
             success: evt.success, failed: evt.failed,
             skipped: evt.skipped, pending: evt.pending || 0,
             currentName: evt.account_name,
-            rows: [...p.rows, { name: evt.account_name, status: evt.status, detail: evt.detail }],
+            rows: [...p.rows, {
+              name: evt.account_name, status: evt.status,
+              detail: evt.detail,
+              message_code: evt.message_code, params: evt.params,
+              error_code: evt.error_code, error_params: evt.error_params,
+            }],
           }))
         } else if (evt.type === 'done') {
           setProgress((p) => ({

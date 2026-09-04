@@ -13,6 +13,8 @@ from ..db import get_db
 from ..models import Account
 from ..schemas import AccountOut, ProfileUpdateIn, UsernameUpdateIn, UsernameCheckOut
 from ..tg_manager import manager
+from ..uploads import ensure_image_upload, read_limited, sanitize_filename, validate_image_bytes, IMAGE_MAX_BYTES
+from ..utils import friendly_error
 from .accounts import _account_to_out
 
 router = APIRouter(prefix="/api/accounts/{account_id}/profile", tags=["profile"])
@@ -42,7 +44,11 @@ async def update_profile(account_id: int, body: ProfileUpdateIn, db: AsyncSessio
                 raise HTTPException(400, "Bio max 70 chars")
             kw["about"] = body.bio
         if kw:
-            await cli(UpdateProfileRequest(**kw))
+            await manager.run_account_action(
+                account_id,
+                lambda: cli(UpdateProfileRequest(**kw)),
+                operation="update_profile",
+            )
         if body.first_name is not None: acc.first_name = body.first_name
         if body.last_name is not None: acc.last_name = body.last_name
         if body.bio is not None: acc.bio = body.bio
@@ -50,8 +56,10 @@ async def update_profile(account_id: int, body: ProfileUpdateIn, db: AsyncSessio
         await db.refresh(acc)
     except FloodWaitError as e:
         raise HTTPException(429, f"FloodWait: wait {e.seconds}s")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(400, f"Profile update failed: {e}")
+        raise HTTPException(400, friendly_error(e))
     return await _account_to_out(acc, db)
 
 
@@ -67,8 +75,8 @@ async def check_username(account_id: int, username: str):
         return UsernameCheckOut(available=False, reason="invalid")
     except UsernameOccupiedError:
         return UsernameCheckOut(available=False, reason="occupied")
-    except Exception as e:
-        return UsernameCheckOut(available=False, reason=str(e)[:80])
+    except Exception:
+        return UsernameCheckOut(available=False, reason="check_failed")
 
 
 @router.put("/username", response_model=AccountOut)
@@ -78,7 +86,11 @@ async def update_username(account_id: int, body: UsernameUpdateIn, db: AsyncSess
         raise HTTPException(404, "Account not found")
     cli = _client_or_404(account_id)
     try:
-        await cli(UpdateUsernameRequest(username=body.username))
+        await manager.run_account_action(
+            account_id,
+            lambda: cli(UpdateUsernameRequest(username=body.username)),
+            operation="update_username",
+        )
         acc.username = body.username
         await db.commit()
         await db.refresh(acc)
@@ -89,7 +101,7 @@ async def update_username(account_id: int, body: UsernameUpdateIn, db: AsyncSess
     except FloodWaitError as e:
         raise HTTPException(429, f"FloodWait: wait {e.seconds}s")
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, friendly_error(e))
     return await _account_to_out(acc, db)
 
 
@@ -99,19 +111,27 @@ async def upload_photo(account_id: int, file: UploadFile = File(...), db: AsyncS
     if not acc:
         raise HTTPException(404, "Account not found")
     cli = _client_or_404(account_id)
-    data = await file.read()
+    ensure_image_upload(file)
+    data = await read_limited(file, IMAGE_MAX_BYTES)
+    validate_image_bytes(data)
     # Telethon needs a file path or BinaryIO with a name
-    suffix = os.path.splitext(file.filename or "photo.jpg")[1] or ".jpg"
+    suffix = sanitize_filename(file.filename) or "photo.jpg"
+    suffix = os.path.splitext(suffix)[1] or ".jpg"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(data)
         tmp_path = tmp.name
     try:
-        uploaded = await cli.upload_file(tmp_path)
-        await cli(UploadProfilePhotoRequest(file=uploaded))
+        async def _upload_photo():
+            uploaded = await cli.upload_file(tmp_path)
+            await cli(UploadProfilePhotoRequest(file=uploaded))
+
+        await manager.run_account_action(
+            account_id, _upload_photo, operation="upload_profile_photo"
+        )
     except FloodWaitError as e:
         raise HTTPException(429, f"FloodWait: wait {e.seconds}s")
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, friendly_error(e))
     finally:
         try: os.unlink(tmp_path)
         except Exception: pass

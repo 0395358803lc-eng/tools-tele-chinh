@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import String, Integer, DateTime, Boolean, Text, ForeignKey, Float
+from sqlalchemy import String, Integer, DateTime, Boolean, Text, ForeignKey, Float, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
 
@@ -25,6 +25,9 @@ class Account(Base):
 
 class SecurityMessage(Base):
     __tablename__ = "security_messages"
+    __table_args__ = (
+        UniqueConstraint("account_id", "tg_msg_id", name="uq_security_account_tg_msg"),
+    )
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"))
     tg_msg_id: Mapped[int] = mapped_column(Integer)

@@ -1,5 +1,7 @@
 """Password auth: bcrypt-verified password, itsdangerous-signed cookie, IP rate limit."""
 from __future__ import annotations
+import asyncio
+import hashlib
 import time
 import secrets
 from collections import defaultdict, deque
@@ -8,7 +10,7 @@ from typing import Optional
 import bcrypt
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from itsdangerous import TimestampSigner, BadSignature, SignatureExpired
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .config import settings
 
@@ -23,7 +25,10 @@ def _password_hash() -> bytes:
     if _pw_hash is None:
         if not settings.APP_PASSWORD:
             raise RuntimeError("APP_PASSWORD not set in .env")
-        _pw_hash = bcrypt.hashpw(settings.APP_PASSWORD.encode(), bcrypt.gensalt(rounds=12))
+        # Pre-hash so bcrypt's 72-byte input ceiling cannot make a valid
+        # (especially Unicode) configured password impossible to verify.
+        material = hashlib.sha256(settings.APP_PASSWORD.encode("utf-8")).digest()
+        _pw_hash = bcrypt.hashpw(material, bcrypt.gensalt(rounds=12))
     return _pw_hash
 
 
@@ -31,7 +36,8 @@ def _verify_password(pw: str) -> bool:
     if not pw:
         return False
     try:
-        return bcrypt.checkpw(pw.encode(), _password_hash())
+        material = hashlib.sha256(pw.encode("utf-8")).digest()
+        return bcrypt.checkpw(material, _password_hash())
     except Exception:
         return False
 
@@ -48,8 +54,8 @@ def _get_signer() -> TimestampSigner:
     global _signer
     if _signer is None:
         secret = settings.SESSION_SECRET
-        if not secret or len(secret) < 16:
-            raise RuntimeError("SESSION_SECRET not set or too short (min 16 chars) in .env")
+        if not secret or len(secret) < 48:
+            raise RuntimeError("SESSION_SECRET not set or too short (min 48 chars) in .env")
         _signer = TimestampSigner(secret, salt="mtm-session-v1")
     return _signer
 
@@ -94,10 +100,15 @@ def _record_failed(ip: str):
 
 
 def _client_ip(req: Request) -> str:
-    fwd = req.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return req.client.host if req.client else "unknown"
+    peer = req.client.host if req.client else "unknown"
+    trusted = {item.strip() for item in settings.TRUSTED_PROXY_IPS.split(",") if item.strip()}
+    if peer in trusted:
+        fwd = req.headers.get("x-forwarded-for")
+        if fwd:
+            candidate = fwd.split(",")[0].strip()
+            if candidate:
+                return candidate
+    return peer
 
 
 # --- FastAPI dependency ---
@@ -112,7 +123,7 @@ router = APIRouter(prefix="/api/auth-app", tags=["auth-app"])
 
 
 class LoginIn(BaseModel):
-    password: str
+    password: str = Field(min_length=1, max_length=256)
 
 
 @router.post("/login")
@@ -123,8 +134,8 @@ async def login(body: LoginIn, request: Request, response: Response):
         raise HTTPException(429, f"Too many attempts. Try again in {retry}s.")
     if not _verify_password(body.password):
         _record_failed(ip)
-        # constant-ish response time
-        time.sleep(0.4)
+        # constant-ish response time floor (non-blocking on the event loop)
+        await asyncio.sleep(0.4)
         raise HTTPException(401, "Wrong password")
     token = _make_token()
     response.set_cookie(

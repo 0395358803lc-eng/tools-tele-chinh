@@ -1,7 +1,9 @@
 import { useEffect, useState, useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
 import { CopyButton } from '../lib/CopyButton'
 import { fmtTime } from '../lib/util'
 import { Endpoints } from '../lib/api'
+import { useToast } from '../lib/toast'
 import AccountAvatar from '../components/AccountAvatar'
 
 function Stat({ label, value, color = 'bg-white', hint }) {
@@ -14,7 +16,7 @@ function Stat({ label, value, color = 'bg-white', hint }) {
   )
 }
 
-function StatusBar({ stats, total }) {
+function StatusBar({ stats, total, t }) {
   const c = stats.connected || 0
   const b = stats.banned || 0
   const d = Math.max(total - c - b, 0)
@@ -22,23 +24,48 @@ function StatusBar({ stats, total }) {
   const pct = (n) => `${(n / total) * 100}%`
   return (
     <div className="flex h-4 border-2 border-black dark:border-white overflow-hidden">
-      <div className="bg-brand-ok"   title={`${c} connected`}    style={{ width: pct(c) }} />
-      <div className="bg-brand-warn" title={`${d} disconnected`} style={{ width: pct(d) }} />
-      <div className="bg-brand-err"  title={`${b} banned`}       style={{ width: pct(b) }} />
+      <div className="bg-brand-ok"   title={t('dashboard.healthConnected', { count: c })}    style={{ width: pct(c) }} />
+      <div className="bg-brand-warn" title={t('dashboard.healthDisconnected', { count: d })} style={{ width: pct(d) }} />
+      <div className="bg-brand-err"  title={t('dashboard.healthBanned', { count: b })}       style={{ width: pct(b) }} />
     </div>
   )
 }
 
-function StatusDot({ status }) {
-  const c = status === 'connected' ? 'bg-brand-ok' : status === 'banned' ? 'bg-brand-err' : 'bg-brand-warn'
-  return <span className={'inline-block w-2 h-2 ' + c + ' border border-black dark:border-white'} title={status} />
+function StatusDot({ status, t }) {
+  const c = status === 'connected' ? 'bg-brand-ok' : ['banned', 'session_revoked', 'auth_error'].includes(status) ? 'bg-brand-err' : status === 'connecting' ? 'bg-brand-violet' : 'bg-brand-warn'
+  return <span className={'inline-block w-2 h-2 ' + c + ' border border-black dark:border-white'} title={statusLabel(status, t)} />
+}
+
+function statusLabel(status, t) {
+  if (status === 'connected') return t('nav.statusConnected')
+  if (status === 'banned') return t('nav.statusBanned')
+  if (status === 'connecting') return 'Connecting'
+  if (status === 'cooldown') return 'Waiting for Telegram'
+  if (status === 'session_revoked') return 'Session revoked'
+  if (status === 'auth_error') return 'Authentication error'
+  return t('nav.statusDisconnected')
 }
 
 export default function DashboardTab({ stats, accounts, onSelect, onChange }) {
+  const { t } = useTranslation()
+  const toast = useToast()
   const [q, setQ] = useState('')
   const [filter, setFilter] = useState('all')   // all|connected|disconnected|banned|2fa|alerts
   const [recentAlerts, setRecentAlerts] = useState([])
   const [marking, setMarking] = useState(false)
+  const [connectionBusy, setConnectionBusy] = useState(null)
+
+  async function connectionAction(key, action) {
+    setConnectionBusy(key)
+    try {
+      await action()
+      await onChange?.()
+    } catch (e) {
+      toast.error(e.message)
+    } finally {
+      setConnectionBusy(null)
+    }
+  }
 
   useEffect(() => {
     Endpoints.securityMessages(undefined, true).then((m) => setRecentAlerts((m || []).slice(0, 10))).catch(() => {})
@@ -79,30 +106,30 @@ export default function DashboardTab({ stats, accounts, onSelect, onChange }) {
     <div className="space-y-4">
       {/* TOP STATS */}
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
-        <Stat label="Total Accounts" value={stats.total} />
-        <Stat label="Connected"      value={stats.connected} color="bg-brand-ok" />
-        <Stat label="Disconnected"   value={Math.max(stats.total - stats.connected - stats.banned, 0)} color="bg-brand-warn" />
-        <Stat label="Banned"         value={stats.banned}    color="bg-brand-err" />
-        <Stat label="2FA Enabled"    value={stats.with_2fa}  color="bg-brand-violet"
-              hint={without2fa > 0 ? `${without2fa} without 2FA` : 'all protected'} />
-        <Stat label="Unread Alerts"  value={totalAlerts}     color={totalAlerts > 0 ? 'bg-brand-err' : 'bg-white'} />
+        <Stat label={t('dashboard.totalAccounts')} value={stats.total} />
+        <Stat label={t('dashboard.connected')}      value={stats.connected} color="bg-brand-ok" />
+        <Stat label={t('dashboard.disconnected')}   value={Math.max(stats.total - stats.connected - stats.banned, 0)} color="bg-brand-warn" />
+        <Stat label={t('dashboard.banned')}         value={stats.banned}    color="bg-brand-err" />
+        <Stat label={t('dashboard.twoFactorEnabled')}    value={stats.with_2fa}  color="bg-brand-violet"
+              hint={without2fa > 0 ? t('dashboard.without2fa', { count: without2fa }) : t('dashboard.allProtected')} />
+        <Stat label={t('dashboard.unreadAlerts')}  value={totalAlerts}     color={totalAlerts > 0 ? 'bg-brand-err' : 'bg-white'} />
       </div>
 
       {/* HEALTH BAR */}
       <div className="nb-card p-4">
         <div className="flex items-center justify-between mb-2">
-          <div className="font-extrabold uppercase text-sm">Account Health</div>
+          <div className="font-extrabold uppercase text-sm">{t('dashboard.accountHealth')}</div>
           <div className="text-xs opacity-70">
-            <span className="font-bold">{onlineCount}</span> online •{' '}
-            <span className="font-bold">{stats.connected}</span> connected •{' '}
-            <span className="font-bold">{stats.with_2fa}/{stats.total}</span> with 2FA
+            <span className="font-bold">{onlineCount}</span> {t('dashboard.online')} •{' '}
+            <span className="font-bold">{stats.connected}</span> {t('dashboard.connected')} •{' '}
+            <span className="font-bold">{stats.with_2fa}/{stats.total}</span> {t('dashboard.with2fa')}
           </div>
         </div>
-        <StatusBar stats={stats} total={stats.total || 1} />
+        <StatusBar stats={stats} total={stats.total || 1} t={t} />
         <div className="flex gap-4 mt-2 text-[11px] flex-wrap">
-          <span className="flex items-center gap-1"><span className="w-3 h-3 bg-brand-ok border border-black" /> Connected ({stats.connected})</span>
-          <span className="flex items-center gap-1"><span className="w-3 h-3 bg-brand-warn border border-black" /> Disconnected ({Math.max(stats.total - stats.connected - stats.banned, 0)})</span>
-          <span className="flex items-center gap-1"><span className="w-3 h-3 bg-brand-err border border-black" /> Banned ({stats.banned})</span>
+          <span className="flex items-center gap-1"><span className="w-3 h-3 bg-brand-ok border border-black" /> {t('dashboard.healthConnected', { count: stats.connected })}</span>
+          <span className="flex items-center gap-1"><span className="w-3 h-3 bg-brand-warn border border-black" /> {t('dashboard.healthDisconnected', { count: Math.max(stats.total - stats.connected - stats.banned, 0) })}</span>
+          <span className="flex items-center gap-1"><span className="w-3 h-3 bg-brand-err border border-black" /> {t('dashboard.healthBanned', { count: stats.banned })}</span>
         </div>
       </div>
 
@@ -110,17 +137,25 @@ export default function DashboardTab({ stats, accounts, onSelect, onChange }) {
         {/* ACCOUNT TABLE (2/3) */}
         <div className="lg:col-span-2 nb-card p-4">
           <div className="flex items-center gap-2 mb-3 flex-wrap">
-            <div className="font-extrabold uppercase">All Accounts ({filtered.length}/{accounts.length})</div>
+            <div className="font-extrabold uppercase">{t('dashboard.allAccounts', { n: filtered.length, total: accounts.length })}</div>
             <div className="ml-auto flex gap-2 items-center flex-wrap">
-              <input className="nb-input !w-44 !py-1 text-xs" placeholder="Search name/phone/@"
+              <button className="nb-btn !py-1 !px-2 text-xs" disabled={connectionBusy !== null}
+                onClick={() => connectionAction('all-connect', Endpoints.connectAll)}>
+                {connectionBusy === 'all-connect' ? t('dashboard.connecting') : t('dashboard.connectAll')}
+              </button>
+              <button className="nb-btn !py-1 !px-2 text-xs" disabled={connectionBusy !== null}
+                onClick={() => connectionAction('all-disconnect', Endpoints.disconnectAll)}>
+                {connectionBusy === 'all-disconnect' ? t('dashboard.disconnecting') : t('dashboard.disconnectAll')}
+              </button>
+              <input className="nb-input !w-44 !py-1 text-xs" placeholder={t('dashboard.searchPlaceholder')}
                 value={q} onChange={(e) => setQ(e.target.value)} />
               <select className="nb-input !w-auto !py-1 text-xs" value={filter} onChange={(e) => setFilter(e.target.value)}>
-                <option value="all">All</option>
-                <option value="connected">Connected</option>
-                <option value="disconnected">Disconnected</option>
-                <option value="banned">Banned</option>
-                <option value="2fa">With 2FA</option>
-                <option value="alerts">With unread alerts</option>
+                <option value="all">{t('common.all')}</option>
+                <option value="connected">{t('dashboard.filterConnected')}</option>
+                <option value="disconnected">{t('dashboard.filterDisconnected')}</option>
+                <option value="banned">{t('dashboard.filterBanned')}</option>
+                <option value="2fa">{t('dashboard.filterWith2fa')}</option>
+                <option value="alerts">{t('dashboard.filterAlerts')}</option>
               </select>
             </div>
           </div>
@@ -128,8 +163,8 @@ export default function DashboardTab({ stats, accounts, onSelect, onChange }) {
           {filtered.length === 0 && (
             <div className="text-sm opacity-60 p-4 text-center">
               {accounts.length === 0
-                ? 'No accounts yet. Add accounts from the sidebar.'
-                : 'No accounts match this filter.'}
+                ? t('dashboard.emptyNoAccounts')
+                : t('dashboard.emptyNoMatch')}
             </div>
           )}
 
@@ -137,13 +172,13 @@ export default function DashboardTab({ stats, accounts, onSelect, onChange }) {
             <table className="w-full text-sm">
               <thead className="text-[10px] uppercase font-extrabold sticky top-0 bg-white dark:bg-zinc-900 border-b-2 border-black dark:border-white">
                 <tr>
-                  <th className="text-left p-2">Account</th>
-                  <th className="text-left p-2">Phone</th>
-                  <th className="text-left p-2">Username</th>
-                  <th className="text-left p-2">Status</th>
+                  <th className="text-left p-2">{t('dashboard.colAccount')}</th>
+                  <th className="text-left p-2">{t('dashboard.colPhone')}</th>
+                  <th className="text-left p-2">{t('dashboard.colUsername')}</th>
+                  <th className="text-left p-2">{t('dashboard.colStatus')}</th>
                   <th className="text-left p-2">2FA</th>
-                  <th className="text-left p-2">Alerts</th>
-                  <th className="text-left p-2">Last Seen</th>
+                  <th className="text-left p-2">{t('dashboard.colAlerts')}</th>
+                  <th className="text-left p-2">{t('dashboard.colLastSeen')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -154,7 +189,7 @@ export default function DashboardTab({ stats, accounts, onSelect, onChange }) {
                       <div className="flex items-center gap-2">
                         <AccountAvatar account={a} size={28} />
                         <span className="font-bold truncate max-w-[140px]">{(a.first_name + ' ' + a.last_name).trim() || '—'}</span>
-                        {a.is_online && <span className="w-2 h-2 bg-brand-ok border border-black" title="online" />}
+                        {a.is_online && <span className="w-2 h-2 bg-brand-ok border border-black" title={t('dashboard.online')} />}
                       </div>
                     </td>
                     <td className="p-2 font-mono text-xs">
@@ -166,12 +201,27 @@ export default function DashboardTab({ stats, accounts, onSelect, onChange }) {
                         : <span className="opacity-40">—</span>}
                     </td>
                     <td className="p-2">
-                      <span className="inline-flex items-center gap-1"><StatusDot status={a.status} /> <span className="text-xs uppercase">{a.status}</span></span>
+                      <span className="inline-flex items-center gap-1"><StatusDot status={a.status} t={t} /> <span className="text-xs uppercase">{statusLabel(a.status, t)}</span></span>
+                      {a.status !== 'banned' && (
+                        <button className="nb-btn !py-0.5 !px-2 text-[10px] ml-2"
+                          disabled={connectionBusy !== null || a.status === 'connecting'}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            const connected = a.status === 'connected'
+                            connectionAction(`account-${a.id}`, () => connected
+                              ? Endpoints.disconnectAccount(a.id)
+                              : Endpoints.connectAccount(a.id))
+                          }}>
+                          {connectionBusy === `account-${a.id}`
+                            ? '…'
+                            : a.status === 'connected' ? t('dashboard.disconnect') : t('dashboard.connect')}
+                        </button>
+                      )}
                     </td>
                     <td className="p-2">
                       {a.has_2fa
-                        ? <span className="nb-badge bg-brand-violet text-black">ON</span>
-                        : <span className="nb-badge bg-zinc-200 text-zinc-700">off</span>}
+                        ? <span className="nb-badge bg-brand-violet text-black">{t('common.on')}</span>
+                        : <span className="nb-badge bg-zinc-200 text-zinc-700">{t('common.off')}</span>}
                     </td>
                     <td className="p-2">
                       {a.unread_security > 0
@@ -191,19 +241,19 @@ export default function DashboardTab({ stats, accounts, onSelect, onChange }) {
         {/* RECENT ALERTS (1/3) */}
         <div className="nb-card p-4 h-fit">
           <div className="flex items-center justify-between mb-3">
-            <div className="font-extrabold uppercase">Recent Alerts</div>
+            <div className="font-extrabold uppercase">{t('dashboard.recentAlerts')}</div>
             <div className="flex items-center gap-2">
               {totalAlerts > 0 && (
                 <button className="nb-btn !py-0.5 !px-2 text-[10px] uppercase font-extrabold"
                         onClick={markAllRead} disabled={marking}>
-                  {marking ? '…' : 'Mark all read'}
+                  {marking ? '…' : t('dashboard.markAllRead')}
                 </button>
               )}
               <span className="nb-badge bg-brand-err text-black">{totalAlerts}</span>
             </div>
           </div>
           {recentAlerts.length === 0 && (
-            <div className="text-sm opacity-60">No unread security messages.</div>
+            <div className="text-sm opacity-60">{t('dashboard.noUnreadAlerts')}</div>
           )}
           <div className="space-y-2 max-h-[60vh] overflow-auto">
             {recentAlerts.map((m) => {

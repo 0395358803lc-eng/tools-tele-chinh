@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { Endpoints } from '../lib/api'
 
 const PRESET_REACTIONS = ['👍', '❤️', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '🎉', '😱', '😢', '🙏', '💯', '🤩']
@@ -14,6 +15,7 @@ const keyOf = (e) => (e.custom_emoji_id ? `c:${e.custom_emoji_id}` : `s:${e.emoj
 // with it. onConfirm(list) receives [{ emoji, pct, custom_emoji_id? }].
 // Reactions the chat has disabled are simply skipped at send time (no error).
 export default function ReactionBuilderModal({ accountCount = 0, accountId = null, postLink = '', initial = [], onConfirm, onClose }) {
+  const { t } = useTranslation()
   const [emojis, setEmojis] = useState(initial.length ? initial : [{ emoji: '🔥', pct: 100 }])
   const [emojiInput, setEmojiInput] = useState('')
 
@@ -29,7 +31,7 @@ export default function ReactionBuilderModal({ accountCount = 0, accountId = nul
     setLoadingAllowed(true); setAllowedErr('')
     Endpoints.allowedReactions(postLink.trim(), accountId || undefined)
       .then((r) => { if (!cancelled) setAllowed(r) })
-      .catch((e) => { if (!cancelled) { setAllowed(null); setAllowedErr(e.message || 'Could not read this chat') } })
+      .catch((e) => { if (!cancelled) { setAllowed(null); setAllowedErr(e.message || t('reaction.readFailed')) } })
       .finally(() => { if (!cancelled) setLoadingAllowed(false) })
     return () => { cancelled = true }
   }, [postLink, accountId])
@@ -78,40 +80,38 @@ export default function ReactionBuilderModal({ accountCount = 0, accountId = nul
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
       <div className="nb-card p-6 w-full max-w-lg max-h-[88vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-3">
-          <h2 className="font-extrabold uppercase tracking-tight">Choose Reactions & %</h2>
+          <h2 className="font-extrabold uppercase tracking-tight">{t('reaction.title')}</h2>
           <button className="nb-btn !py-1 !px-2" onClick={onClose}>✕</button>
         </div>
 
         <p className="text-xs opacity-70 mb-2">
-          Pick reactions and drag each bar to set what share of the <b>{accountCount}</b> selected
-          account{accountCount === 1 ? '' : 's'} react with it. Any reaction the chat has disabled is
-          simply skipped (shown in the results) — no error.
+          {t('reaction.desc', { count: accountCount })}
         </p>
 
         {/* what this chat allows */}
-        {loadingAllowed && <div className="text-xs opacity-60 mb-2">Reading this chat's allowed reactions…</div>}
+        {loadingAllowed && <div className="text-xs opacity-60 mb-2">{t('reaction.readingAllowed')}</div>}
         {reactionsOff && (
           <div className="nb-card-sm p-2 mb-2 bg-brand-err text-black text-xs font-bold">
-            This chat has reactions turned OFF — no reaction will work here.
+            {t('reaction.reactionsOff')}
           </div>
         )}
         {allowed?.mode === 'some' && !reactionsOff && (
           <div className="nb-card-sm p-2 mb-2 bg-brand-warn text-black text-[11px] font-bold">
-            This chat allows only the reactions shown below. Others will be skipped.
+            {t('reaction.someAllowed')}
           </div>
         )}
         {allowed?.mode === 'all' && !allowed?.allow_custom && (
-          <div className="text-[11px] opacity-70 mb-2">All standard emoji are allowed here, but custom (premium) emoji are not.</div>
+          <div className="text-[11px] opacity-70 mb-2">{t('reaction.allStdNoCustom')}</div>
         )}
         {allowedErr && (
-          <div className="text-[11px] opacity-70 mb-2">Couldn't read this chat's allowed reactions ({allowedErr}). You can still pick standard emoji — disabled ones get skipped.</div>
+          <div className="text-[11px] opacity-70 mb-2">{t('reaction.couldntRead', { err: allowedErr })}</div>
         )}
         {!postLink?.trim() && (
-          <div className="text-[11px] opacity-70 mb-2">Tip: paste the post link first to see exactly which reactions this chat allows.</div>
+          <div className="text-[11px] opacity-70 mb-2">{t('reaction.tipPasteFirst')}</div>
         )}
 
         {/* standard preset grid — click to add/remove */}
-        <div className="text-[11px] font-bold uppercase opacity-70 mb-1">Standard reactions</div>
+        <div className="text-[11px] font-bold uppercase opacity-70 mb-1">{t('reaction.standardReactions')}</div>
         <div className="flex gap-1 flex-wrap mb-2">
           {standardPresets.map((r) => {
             const on = hasStd(r)
@@ -127,12 +127,12 @@ export default function ReactionBuilderModal({ accountCount = 0, accountId = nul
         {/* custom (premium) emoji this chat allows */}
         {customAllowed.length > 0 && (
           <>
-            <div className="text-[11px] font-bold uppercase opacity-70 mb-1">Custom emoji this chat allows</div>
+            <div className="text-[11px] font-bold uppercase opacity-70 mb-1">{t('reaction.customAllowed')}</div>
             <div className="flex gap-1 flex-wrap mb-2">
               {customAllowed.map((c) => {
                 const on = hasCustom(c.id)
                 return (
-                  <button key={c.id} title={`custom emoji ${c.id}`} onClick={() => on ? removeKey(`c:${c.id}`) : addCustom(c)}
+                  <button key={c.id} title={t('reaction.customEmojiTitle', { id: c.id })} onClick={() => on ? removeKey(`c:${c.id}`) : addCustom(c)}
                     className={'h-9 px-2 text-lg border-2 border-black dark:border-white flex items-center gap-1 ' + (on ? 'bg-brand-pri' : 'bg-white dark:bg-zinc-900')}>
                     <span>{c.alt || '⭐'}</span>
                     <span className="text-[9px] font-bold opacity-60">★</span>
@@ -145,23 +145,23 @@ export default function ReactionBuilderModal({ accountCount = 0, accountId = nul
 
         {/* add any (standard/pasted) emoji */}
         <div className="flex gap-2 mb-3">
-          <input className="nb-input !py-1 text-sm" placeholder="paste / type any emoji"
+          <input className="nb-input !py-1 text-sm" placeholder={t('reaction.pasteAnyEmoji')}
             value={emojiInput} onChange={(e) => setEmojiInput(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') { addStandard(emojiInput); setEmojiInput('') } }} />
-          <button className="nb-btn !px-3" onClick={() => { addStandard(emojiInput); setEmojiInput('') }}>Add</button>
+          <button className="nb-btn !px-3" onClick={() => { addStandard(emojiInput); setEmojiInput('') }}>{t('reaction.add')}</button>
         </div>
 
         {/* per-emoji percentage bars */}
         <div className="nb-card-sm p-3 mb-3 space-y-2 overflow-auto flex-1">
           <div className="flex items-center mb-1">
-            <span className="font-bold text-xs uppercase">% of accounts per reaction</span>
-            <button className="nb-btn !py-0.5 !px-1 text-[10px] ml-2" onClick={evenSplit}>Even split</button>
+            <span className="font-bold text-xs uppercase">{t('reaction.pctPerReaction')}</span>
+            <button className="nb-btn !py-0.5 !px-1 text-[10px] ml-2" onClick={evenSplit}>{t('reaction.evenSplit')}</button>
             <span className={'text-xs ml-auto font-bold ' + (totalPct > 100 ? 'text-brand-err' : 'opacity-70')}>
-              total {totalPct}%
+              {t('reaction.total', { count: totalPct })}
             </span>
           </div>
           {emojis.length === 0 && (
-            <div className="text-xs opacity-60">Add at least one reaction above.</div>
+            <div className="text-xs opacity-60">{t('reaction.addAtLeastOne')}</div>
           )}
           {emojis.map((e) => {
             const k = keyOf(e)
@@ -174,21 +174,21 @@ export default function ReactionBuilderModal({ accountCount = 0, accountId = nul
                 <input type="range" min="0" max="100" value={e.pct} className="flex-1"
                   onChange={(ev) => setPct(k, Number(ev.target.value))} />
                 <span className="font-mono text-xs w-10 text-right">{e.pct}%</span>
-                <span className={'font-mono text-[11px] w-16 text-right ' + (countFor(e.pct) === 0 ? 'text-brand-warn font-bold' : 'opacity-70')}>→ {countFor(e.pct)} acc</span>
+                <span className={'font-mono text-[11px] w-16 text-right ' + (countFor(e.pct) === 0 ? 'text-brand-warn font-bold' : 'opacity-70')}>→ {t('reaction.acc', { count: countFor(e.pct) })}</span>
                 <button className="text-xs opacity-60 hover:opacity-100" onClick={() => removeKey(k)}>✕</button>
               </div>
             )
           })}
-          {totalPct > 100 && <div className="text-[11px] text-brand-err">Total is over 100% — lower some bars.</div>}
+          {totalPct > 100 && <div className="text-[11px] text-brand-err">{t('reaction.totalOver100')}</div>}
           {totalPct < 100 && emojis.length > 0 && (
-            <div className="text-[11px] opacity-60">{100 - totalPct}% of accounts ({countFor(100 - totalPct)}) won't react.</div>
+            <div className="text-[11px] opacity-60">{t('reaction.wontReact', { count: 100 - totalPct, n: countFor(100 - totalPct) })}</div>
           )}
         </div>
 
         <div className="flex gap-2 justify-end">
-          <button className="nb-btn" onClick={onClose}>Cancel</button>
+          <button className="nb-btn" onClick={onClose}>{t('reaction.cancel')}</button>
           <button className="nb-btn-pri" disabled={emojis.length === 0 || totalPct === 0 || totalPct > 100 || reactionsOff} onClick={done}>
-            Done
+            {t('reaction.done')}
           </button>
         </div>
       </div>

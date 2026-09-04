@@ -18,3 +18,5 @@ backend/static/
 .vite/
 .DS_Store
 *.log
+data/
+release/

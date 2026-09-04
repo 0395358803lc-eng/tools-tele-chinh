@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { rowText } from '../lib/err'
+import { statusText } from '../lib/util'
 
 const STATUS_COLOR = {
   ok: 'bg-brand-ok',
@@ -14,6 +17,7 @@ function Badge({ label, n, color }) {
 
 // Live progress for a streaming bulk task. `progress` comes from useBulkProgress().
 export default function ProgressModal({ progress, onClose }) {
+  const { t } = useTranslation()
   const listRef = useRef(null)
   const startRef = useRef(null)
   const [elapsed, setElapsed] = useState(0)
@@ -40,8 +44,8 @@ export default function ProgressModal({ progress, onClose }) {
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
       <div className="nb-card p-6 w-full max-w-lg max-h-[85vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-3">
-          <h2 className="font-extrabold uppercase tracking-tight">{title || 'Working…'}</h2>
-          <button className="nb-btn !py-1 !px-2" onClick={onClose} disabled={!done} title={done ? 'Close' : 'Running…'}>✕</button>
+          <h2 className="font-extrabold uppercase tracking-tight">{title || t('progress.running')}</h2>
+          <button className="nb-btn !py-1 !px-2" onClick={onClose} disabled={!done} title={done ? t('progress.close') : t('progress.running')}>✕</button>
         </div>
 
         {/* progress bar */}
@@ -50,13 +54,13 @@ export default function ProgressModal({ progress, onClose }) {
         </div>
         <div className="flex items-center gap-2 mb-3 flex-wrap text-xs">
           <span className="font-mono font-bold">{current}/{total || '…'}</span>
-          <Badge label="ok" n={success} color="bg-brand-ok" />
-          <Badge label="failed" n={failed} color="bg-brand-err" />
-          <Badge label="pending" n={pending} color="bg-brand-violet" />
-          <Badge label="skipped" n={skipped} color="bg-brand-warn" />
+          <Badge label={t('progress.statusOk')} n={success} color="bg-brand-ok" />
+          <Badge label={t('progress.statusFailed')} n={failed} color="bg-brand-err" />
+          <Badge label={t('progress.statusPending')} n={pending} color="bg-brand-violet" />
+          <Badge label={t('progress.statusSkipped')} n={skipped} color="bg-brand-warn" />
           <span className="font-mono opacity-60">{elapsed.toFixed(1)}s</span>
           <span className="ml-auto opacity-70">
-            {done ? (error ? 'Stopped' : 'Done') : (currentName ? `→ ${currentName}` : 'Starting…')}
+            {done ? (error ? t('progress.stopped') : t('progress.done')) : (currentName ? `→ ${currentName}` : t('progress.starting'))}
           </span>
         </div>
 
@@ -67,15 +71,15 @@ export default function ProgressModal({ progress, onClose }) {
         <div ref={listRef} className="space-y-1 overflow-auto flex-1">
           {rows.map((r, i) => (
             <div key={i} className="nb-card-sm p-2 text-sm flex items-center gap-2">
-              <span className={'nb-badge text-black ' + (STATUS_COLOR[r.status] || 'bg-white')}>{r.status}</span>
+              <span className={'nb-badge text-black ' + (STATUS_COLOR[r.status] || 'bg-white')}>{statusText(r.status)}</span>
               <span className="font-medium truncate">{r.name}</span>
-              {r.detail && <span className="text-xs opacity-70 truncate ml-auto">{r.detail}</span>}
+              {rowText(r) && <span className="text-xs opacity-70 truncate ml-auto" title={rowText(r)}>{rowText(r)}</span>}
             </div>
           ))}
         </div>
 
         {done && (
-          <button className="nb-btn-pri mt-3 w-full" onClick={onClose}>Close</button>
+          <button className="nb-btn-pri mt-3 w-full" onClick={onClose}>{t('progress.close')}</button>
         )}
       </div>
     </div>

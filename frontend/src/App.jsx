@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
+import { useTranslation } from 'react-i18next'
 import { Endpoints, onUnauthorized } from './lib/api'
 import { useToast } from './lib/toast.jsx'
 import { useTheme } from './lib/theme'
@@ -17,20 +18,22 @@ import BulkTab from './tabs/BulkTab.jsx'
 import SettingsTab from './tabs/SettingsTab.jsx'
 
 const TABS = [
-  { id: 'dashboard', label: 'Dashboard' },
-  { id: 'profile',   label: 'Profile'   },
-  { id: 'security',  label: 'Security'  },
-  { id: 'groups',    label: 'Groups'    },
-  { id: 'messages',  label: 'Messages'  },
-  { id: 'checker',   label: 'Checker'   },
-  { id: 'bulk',      label: 'Bulk'      },
-  { id: 'settings',  label: 'Settings'  },
+  { id: 'dashboard', labelKey: 'navigation.dashboard' },
+  { id: 'profile',   labelKey: 'navigation.profile'   },
+  { id: 'security',  labelKey: 'navigation.security'  },
+  { id: 'groups',    labelKey: 'navigation.groups'    },
+  { id: 'messages',  labelKey: 'navigation.messages'  },
+  { id: 'checker',   labelKey: 'navigation.checker'   },
+  { id: 'bulk',      labelKey: 'navigation.bulk'      },
+  { id: 'settings',  labelKey: 'navigation.settings'  },
 ]
 
 export default function App() {
+  const { t } = useTranslation()
   const toast = useToast()
   const { theme, toggle } = useTheme()
   const [authState, setAuthState] = useState('checking') // checking | in | out
+  const [health, setHealth] = useState(null)
   const [accounts, setAccounts] = useState([])
   const [gone, setGone] = useState([])  // banned/removed account history
   const [stats, setStats] = useState({ total: 0, connected: 0, banned: 0, with_2fa: 0, unread_security: 0 })
@@ -42,6 +45,7 @@ export default function App() {
 
   // initial auth check
   useEffect(() => {
+    Endpoints.health().then(setHealth).catch(() => setHealth({ backend: 'error', database: 'unknown' }))
     Endpoints.me()
       .then((r) => setAuthState(r?.authed ? 'in' : 'out'))
       .catch(() => setAuthState('out'))
@@ -68,7 +72,7 @@ export default function App() {
     } catch (e) {
       // Stay silent on polling failures — only show error on first-load
       if (accounts.length === 0 && !e.network && e.status !== 401) {
-        toast.error('Load accounts: ' + e.message)
+        toast.error(t('common.loading') + ' accounts: ' + e.message)
       }
     }
   }, [selectedId, toast, accounts.length])
@@ -82,7 +86,7 @@ export default function App() {
       const s = await Endpoints.stats()
       setStats(s)
       if (s.unread_security > prevUnreadRef.current && prevUnreadRef.current !== 0) {
-        desktopNotify('New security message', `Unread: ${s.unread_security}`)
+        desktopNotify(t('nav.statusConnected') + ' · ' + t('app.title'), `Unread: ${s.unread_security}`)
       }
       prevUnreadRef.current = s.unread_security
     } catch (e) { /* silent */ }
@@ -101,7 +105,17 @@ export default function App() {
   if (authState === 'checking') {
     return (
       <div className="min-h-screen flex items-center justify-center bg-zinc-100 dark:bg-zinc-950">
-        <div className="nb-card-sm p-4 font-bold uppercase tracking-tight">Loading…</div>
+        <div className="nb-card-sm p-4 font-bold uppercase tracking-tight">{t('common.loading')}</div>
+      </div>
+    )
+  }
+  if (health?.database === 'error' || health?.secret_store === 'error') {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-zinc-100 dark:bg-zinc-950 p-6">
+        <div className="nb-card p-6 max-w-xl">
+          <h1 className="font-extrabold text-xl uppercase text-brand-err">Startup health problem detected</h1>
+          <p className="mt-3">Telegram clients were not started. Check database integrity and Windows DPAPI, then restore a known-good backup if needed.</p>
+        </div>
       </div>
     )
   }
@@ -118,12 +132,13 @@ export default function App() {
           ☰
         </button>
         <h1 className="font-extrabold text-xl uppercase tracking-tighter">Multi TG Manager</h1>
+        {health && health.telegram_api !== 'configured' && <span className="nb-badge bg-brand-err text-black">Telegram API missing</span>}
         <div className="flex-1" />
         <TopStats stats={stats} onBellClick={() => setTab('security')} />
-        <button onClick={toggle} className="nb-btn !bg-white !text-black !py-1 !px-2" title="Toggle theme">
+        <button onClick={toggle} className="nb-btn !bg-white !text-black !py-1 !px-2" title={t('app.theme')}>
           {theme === 'dark' ? '☀' : '☾'}
         </button>
-        <button onClick={logout} className="nb-btn !bg-white !text-black !py-1 !px-2" title="Logout">
+        <button onClick={logout} className="nb-btn !bg-white !text-black !py-1 !px-2" title={t('app.logout')}>
           ⏻
         </button>
       </header>
@@ -143,13 +158,13 @@ export default function App() {
 
         <main className="flex-1 min-w-0 flex flex-col">
           <nav className="flex gap-1 px-4 pt-3 flex-wrap border-b-2 border-black dark:border-white bg-zinc-100 dark:bg-zinc-900">
-            {TABS.map((t) => (
+            {TABS.map((tabItem) => (
               <button
-                key={t.id}
-                className={`nb-tab ${tab === t.id ? 'nb-tab-active' : ''}`}
-                onClick={() => setTab(t.id)}
+                key={tabItem.id}
+                className={`nb-tab ${tab === tabItem.id ? 'nb-tab-active' : ''}`}
+                onClick={() => setTab(tabItem.id)}
               >
-                {t.label}
+                {t(tabItem.labelKey)}
               </button>
             ))}
           </nav>

@@ -1,17 +1,22 @@
 """Manage one Telethon client per account, with 777000 listeners."""
 from __future__ import annotations
 import asyncio
+from contextlib import suppress
 import logging
+import os
+import random
 import re
 import secrets
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional, TypeVar
 
 from telethon import TelegramClient, events
 from telethon.errors import (
     AuthKeyUnregisteredError,
+    FloodWaitError,
     UserDeactivatedBanError,
     UserDeactivatedError,
     SessionPasswordNeededError,
@@ -21,15 +26,24 @@ from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRe
 from telethon.tl.functions.photos import UploadProfilePhotoRequest
 from telethon.tl.types import User as TgUser
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from .config import settings
 from .db import AsyncSessionLocal
-from .models import Account, SecurityMessage, GoneAccount
+from .models import Account, AppSetting, SecurityMessage, GoneAccount
 from . import secrets_store
+from .tg_utils import (
+    RECONNECT_BACKOFF_SECONDS,
+    classify_777000,
+    normalize_phone as _normalize_phone,
+    permanent_connection_status,
+    redact_login_code,
+)
 
 log = logging.getLogger("tg_manager")
 
 SERVICE_ID = 777000
+T = TypeVar("T")
 
 
 async def record_gone_account(db, acc: Account, reason: str):
@@ -58,17 +72,6 @@ async def record_gone_account(db, acc: Account, reason: str):
     ))
 
 
-def classify_777000(text: str) -> str:
-    low = text.lower()
-    if re.search(r"login code|\b\d{5}\b", low):
-        return "login_code"
-    if "new login" in low or "new device" in low:
-        return "new_login"
-    if "two-step" in low or "password" in low:
-        return "2fa_change"
-    if "delete" in low or "deactivation" in low:
-        return "account_deletion"
-    return "unknown"
 
 
 class TgClientManager:
@@ -76,15 +79,37 @@ class TgClientManager:
         self._clients: dict[int, TelegramClient] = {}  # account_id -> client
         self._pending: dict[str, dict] = {}  # phone -> {'client', 'phone_code_hash', 'needs_2fa'}
         self._qr_pending: dict[str, dict] = {}  # qr_id -> {'client', 'qr_login', 'wait_task', 'needs_2fa', 'session_path'}
+        self._phone_locks: dict[str, asyncio.Lock] = {}
+        self._qr_locks: dict[str, asyncio.Lock] = {}
+        self._qr_completed: dict[str, tuple[float, dict]] = {}
+        self._service_handlers: dict[int, tuple[TelegramClient, object]] = {}
         # Per-account locks so two calls can't start/stop the SAME account at
         # once, while DIFFERENT accounts still connect concurrently (a single
         # global lock would serialize all 100+ accounts on boot).
         self._locks: dict[int, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+        # Telegram state-changing calls use a separate per-account scheduler.
+        # Lifecycle locks above protect client creation/removal; action locks
+        # below guarantee that one account never performs two mutations at once.
+        self._action_locks: dict[int, asyncio.Lock] = {}
+        self._cooldown_until: dict[int, float] = {}
+        self._next_allowed_at: dict[int, float] = {}
+        self._accepting_actions = True
+        self._active_actions = 0
+        self._actions_idle = asyncio.Event()
+        self._actions_idle.set()
+        self.auto_reconnect = True
+        self._reconnect_attempts: dict[int, int] = {}
+        self._reconnect_at: dict[int, float] = {}
+        self._reconnect_exhausted: set[int] = set()
+        self._manual_disconnect: set[int] = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._new_msg_callbacks: list = []
         self._session_scan_lock = asyncio.Lock()
         self._session_scan_seen: dict[str, tuple[int, int]] = {}
+        self._background_tasks: set[asyncio.Task] = set()
+        self._last_auth_check: dict[int, float] = {}
+        self._auth_cursor: int = 0
 
     def set_loop(self, loop):
         self._loop = loop
@@ -97,10 +122,126 @@ class TgClientManager:
                 self._locks[account_id] = lk
             return lk
 
+    def get_action_lock(self, account_id: int) -> asyncio.Lock:
+        """Return the mutation lock for an account.
+
+        This method intentionally has no await: all accesses happen on the
+        application's single asyncio event loop, so creating with setdefault
+        cannot race with another Python task between bytecode instructions.
+        """
+        lock = self._action_locks.get(account_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._action_locks[account_id] = lock
+        return lock
+
+    async def wait_for_account_cooldown(self, account_id: int):
+        """Wait for both Telegram FloodWait and normal per-account pacing."""
+        until = max(
+            self._cooldown_until.get(account_id, 0.0),
+            self._next_allowed_at.get(account_id, 0.0),
+        )
+        delay = until - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    def note_flood_wait(self, account_id: int, seconds: int | float):
+        """Apply a FloodWait to every subsequent mutation for this account."""
+        seconds = max(0.0, float(seconds))
+        until = time.monotonic() + seconds
+        self._cooldown_until[account_id] = max(
+            self._cooldown_until.get(account_id, 0.0), until
+        )
+        log.warning(
+            "account=%s operation=telegram_mutation error_code=FLOOD_WAIT seconds=%s",
+            account_id,
+            int(seconds),
+        )
+
+    def cooldown_remaining(self, account_id: int) -> float:
+        return max(0.0, self._cooldown_until.get(account_id, 0.0) - time.monotonic())
+
+    async def run_account_action(
+        self,
+        account_id: int,
+        action: Callable[[], Awaitable[T]],
+        operation: str = "telegram_mutation",
+    ) -> T:
+        """Serialize, cool down and pace one Telegram mutation.
+
+        Different account IDs have independent locks and therefore still run in
+        parallel. FloodWait is recorded before it is re-raised to the router.
+        """
+        if not self._accepting_actions:
+            raise RuntimeError("Application is shutting down")
+
+        self._active_actions += 1
+        self._actions_idle.clear()
+        started = time.monotonic()
+        invoked = False
+        try:
+            async with self.get_action_lock(account_id):
+                await self.wait_for_account_cooldown(account_id)
+                invoked = True
+                try:
+                    result = await action()
+                except FloodWaitError as exc:
+                    self.note_flood_wait(account_id, exc.seconds)
+                    raise
+                finally:
+                    if invoked:
+                        lo = max(0.0, float(getattr(settings, "RATE_MIN", 0.0)))
+                        hi = max(lo, float(getattr(settings, "RATE_MAX", lo)))
+                        self._next_allowed_at[account_id] = (
+                            time.monotonic() + random.uniform(lo, hi)
+                        )
+                duration_ms = int((time.monotonic() - started) * 1000)
+                log.info(
+                    "account=%s operation=%s status=success duration_ms=%s",
+                    account_id,
+                    operation,
+                    duration_ms,
+                )
+                return result
+        except FloodWaitError:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            log.warning(
+                "account=%s operation=%s status=rate_limited duration_ms=%s",
+                account_id,
+                operation,
+                duration_ms,
+            )
+            raise
+        except Exception:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            log.exception(
+                "account=%s operation=%s status=failed duration_ms=%s",
+                account_id,
+                operation,
+                duration_ms,
+            )
+            raise
+        finally:
+            self._active_actions -= 1
+            if self._active_actions == 0:
+                self._actions_idle.set()
+
+    def resume_actions(self):
+        """Allow actions after startup (mainly useful for lifespan/tests)."""
+        self._accepting_actions = True
+
     # ---------- helpers ----------
+    @staticmethod
+    def normalize_phone(phone: str) -> str:
+        return _normalize_phone(phone)
+
     def _session_path(self, phone: str) -> str:
-        safe = re.sub(r"[^0-9]", "", phone)
+        safe = self.normalize_phone(phone)[1:]
         return str(settings.sessions_path / f"acc_{safe}")
+
+    def _phone_temp_session_path(self, phone: str) -> str:
+        digits = self.normalize_phone(phone)[1:]
+        return str(settings.sessions_path / f"login_{digits}_{secrets.token_urlsafe(8)}")
 
     @staticmethod
     def _phone_file_part(phone: str) -> str:
@@ -173,7 +314,66 @@ class TgClientManager:
             d = Path(str(dst) + suffix)
             shutil.move(str(s), str(d))
 
+    def begin_session_swap(self, src_base: str, dst_base: str) -> dict:
+        """Install a verified, disconnected session with an atomic replace.
+
+        Existing destination files are renamed to unique rollback files first.
+        The returned token must be committed or rolled back by the caller after
+        its database transaction and client startup complete.
+        """
+        src = Path(src_base)
+        dst = Path(dst_base)
+        src_main = Path(str(src) + ".session")
+        if not src_main.is_file():
+            raise RuntimeError("Verified session file is missing")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        suffixes = [".session", ".session-journal", ".session-wal", ".session-shm"]
+        token = secrets.token_hex(8)
+        state = {
+            "src": str(src), "dst": str(dst), "moved": [], "backups": []
+        }
+        try:
+            for suffix in suffixes:
+                target = Path(str(dst) + suffix)
+                if target.exists():
+                    backup = Path(str(target) + f".rollback-{token}")
+                    os.replace(target, backup)
+                    state["backups"].append((str(target), str(backup)))
+            for suffix in suffixes:
+                source = Path(str(src) + suffix)
+                if source.exists():
+                    target = Path(str(dst) + suffix)
+                    os.replace(source, target)
+                    state["moved"].append((str(source), str(target)))
+            if not Path(str(dst) + ".session").is_file():
+                raise RuntimeError("Session replace did not produce a destination file")
+            return state
+        except BaseException:
+            self.rollback_session_swap(state)
+            raise
+
+    def rollback_session_swap(self, state: dict):
+        for source, target in reversed(state.get("moved", [])):
+            target_path = Path(target)
+            if target_path.exists():
+                Path(source).parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target_path, source)
+        for target, backup in reversed(state.get("backups", [])):
+            backup_path = Path(backup)
+            if backup_path.exists():
+                os.replace(backup_path, target)
+
+    def commit_session_swap(self, state: dict, old_bases: list[str] | None = None):
+        for _target, backup in state.get("backups", []):
+            self._safe_unlink(backup)
+        destination = str(Path(state["dst"]).resolve()).lower()
+        for base in old_bases or []:
+            if base and str(Path(base).resolve()).lower() != destination:
+                self._remove_session_files(base)
+
     def _remove_session_files(self, base: str):
+        if not base:
+            return
         for suffix in [".session", ".session-journal", ".session-wal", ".session-shm"]:
             self._safe_unlink(base + suffix)
 
@@ -187,7 +387,12 @@ class TgClientManager:
 
         The caller owns moving or deleting the session files after this returns.
         """
-        cli = TelegramClient(session_base, settings.TG_API_ID, settings.TG_API_HASH)
+        if not settings.api_configured:
+            raise RuntimeError(
+                "TG_API_ID / TG_API_HASH are not set in backend/.env — cannot inspect session.\n"
+                "Get your credentials from https://my.telegram.org and fill them in."
+            )
+        cli = TelegramClient(session_base, settings.tg_api_id, settings.TG_API_HASH)
         try:
             await asyncio.wait_for(cli.connect(), timeout=20)
             if not await asyncio.wait_for(cli.is_user_authorized(), timeout=20):
@@ -219,10 +424,7 @@ class TgClientManager:
 
     @staticmethod
     def _session_error_detail(e: Exception) -> str:
-        if type(e).__name__ == "RuntimeError":
-            return str(e) or "Session import failed"
-        msg = str(e)
-        return f"{type(e).__name__}: {msg[:140]}" if msg else type(e).__name__
+        return f"Session import failed ({type(e).__name__})"
 
     @staticmethod
     def _is_importable_session_file(path: Path) -> bool:
@@ -371,8 +573,64 @@ class TgClientManager:
         return dict(self._clients)
 
     # ---------- lifecycle ----------
+    async def redact_stored_login_codes(self):
+        """One-time migration: scrub any OTP digits that a previous version stored
+        inside type='login_code' SecurityMessage rows. Runs on every boot but is a
+        no-op once no legacy digits remain."""
+        try:
+            async with AsyncSessionLocal() as db:
+                res = await db.execute(
+                    select(SecurityMessage).where(SecurityMessage.type == "login_code")
+                )
+                changed = 0
+                for sm in res.scalars().all():
+                    cleaned = redact_login_code(sm.message_text or "")
+                    if cleaned != sm.message_text:
+                        sm.message_text = cleaned
+                        changed += 1
+                if changed:
+                    await db.commit()
+                    log.info("redacted OTP digits from %d stored 777000 login messages", changed)
+        except Exception as e:
+            log.warning("login-code redaction skipped: %s", e)
+
+    async def load_runtime_settings(self):
+        """Apply persisted settings before any Telegram client is created."""
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(select(AppSetting))
+            values = {row.key: row.value for row in res.scalars().all()}
+
+        def _float(name: str, current: float) -> float:
+            try:
+                return float(values.get(name, current))
+            except (TypeError, ValueError):
+                return current
+
+        def _int(name: str, current: int) -> int:
+            try:
+                return max(1, int(float(values.get(name, current))))
+            except (TypeError, ValueError):
+                return current
+
+        settings.RATE_MIN = max(0.0, _float("rate_min", settings.RATE_MIN))
+        settings.RATE_MAX = max(settings.RATE_MIN, _float("rate_max", settings.RATE_MAX))
+        settings.CONCURRENCY = _int("concurrency", settings.CONCURRENCY)
+        self.auto_reconnect = values.get("auto_reconnect", "true").lower() == "true"
+
     async def startup_load_all(self):
-        """On boot, start clients for every previously-authorized account."""
+        """Load settings and optionally connect previously-authorized accounts."""
+        await self.redact_stored_login_codes()
+        await self.load_runtime_settings()
+        self.resume_actions()
+        if not self.auto_reconnect:
+            async with AsyncSessionLocal() as db:
+                res = await db.execute(select(Account))
+                for acc in res.scalars().all():
+                    if acc.status not in {"banned", "session_revoked", "auth_error"}:
+                        acc.status = "disconnected"
+                await db.commit()
+            log.info("auto_reconnect is disabled; Telegram clients remain disconnected")
+            return
         async with AsyncSessionLocal() as db:
             res = await db.execute(select(Account))
             accounts = res.scalars().all()
@@ -386,7 +644,15 @@ class TgClientManager:
                 except Exception as e:
                     log.warning("Failed to start client for %s: %s", acc.phone, e)
 
-        await asyncio.gather(*(_start_one(acc) for acc in accounts))
+        eligible = [
+            acc for acc in accounts
+            if acc.status not in {"banned", "session_revoked", "auth_error"}
+        ]
+        await asyncio.gather(*(_start_one(acc) for acc in eligible))
+
+        janitor = asyncio.create_task(self._pending_janitor())
+        self._background_tasks.add(janitor)
+        janitor.add_done_callback(self._background_tasks.discard)
 
         async def _sync_pasted_sessions():
             try:
@@ -401,63 +667,195 @@ class TgClientManager:
             except Exception as e:
                 log.warning("session folder sync failed: %s", e)
 
-        asyncio.create_task(_sync_pasted_sessions())
+        sync_task = asyncio.create_task(_sync_pasted_sessions())
+        self._background_tasks.add(sync_task)
+        sync_task.add_done_callback(self._background_tasks.discard)
 
-    async def shutdown(self):
+    async def shutdown(self, action_timeout: float = 30.0):
+        self._accepting_actions = False
+        background = list(self._background_tasks)
+        for task in background:
+            task.cancel()
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
+        self._background_tasks.clear()
+        try:
+            await asyncio.wait_for(self._actions_idle.wait(), timeout=action_timeout)
+        except asyncio.TimeoutError:
+            log.warning(
+                "graceful shutdown timed out with %s Telegram action(s) pending",
+                self._active_actions,
+            )
         for cli in list(self._clients.values()):
             try:
                 await cli.disconnect()
             except Exception:
                 pass
+        self._service_handlers.clear()
         for pend in list(self._pending.values()):
-            try: await pend['client'].disconnect()
-            except Exception: pass
+            try:
+                await pend['client'].disconnect()
+            except (Exception, asyncio.CancelledError):
+                pass
+            self._remove_session_files(pend.get('session_path', ''))
         for qr in list(self._qr_pending.values()):
             t = qr.get('wait_task')
             if t and not t.done():
                 t.cancel()
-            try: await qr['client'].disconnect()
-            except Exception: pass
+                with suppress(asyncio.CancelledError):
+                    await t
+            try:
+                await qr['client'].disconnect()
+            except (Exception, asyncio.CancelledError):
+                pass
+            self._remove_session_files(qr.get('session_path', ''))
         self._clients.clear()
         self._pending.clear()
         self._qr_pending.clear()
+        self._qr_completed.clear()
+        self._qr_locks.clear()
 
-    async def start_client(self, acc: Account) -> TelegramClient:
-        lock = await self._acc_lock(acc.id)
-        async with lock:
-            if acc.id in self._clients:
-                return self._clients[acc.id]
-            cli = TelegramClient(self._session_path_for_account(acc), settings.TG_API_ID, settings.TG_API_HASH)
-            await cli.connect()
-            if not await cli.is_user_authorized():
-                await cli.disconnect()
-                await self._set_status(acc.id, "disconnected")
-                raise RuntimeError("not authorized")
+    @staticmethod
+    def _permanent_status(exc: Exception) -> str | None:
+        return permanent_connection_status(exc)
+
+    def _reset_reconnect(self, account_id: int):
+        self._reconnect_attempts.pop(account_id, None)
+        self._reconnect_at.pop(account_id, None)
+        self._reconnect_exhausted.discard(account_id)
+
+    async def _record_connection_failure(self, account_id: int, exc: Exception):
+        permanent = self._permanent_status(exc)
+        if permanent:
+            self._reconnect_exhausted.add(account_id)
+            self._reconnect_at.pop(account_id, None)
+            if permanent == "banned":
+                await self._mark_banned(account_id)
+            else:
+                await self._set_status(account_id, permanent)
+            return
+
+        attempts = self._reconnect_attempts.get(account_id, 0) + 1
+        self._reconnect_attempts[account_id] = attempts
+        await self._set_status(account_id, "disconnected")
+        if attempts > len(RECONNECT_BACKOFF_SECONDS):
+            self._reconnect_exhausted.add(account_id)
+            self._reconnect_at.pop(account_id, None)
+            log.warning("account=%s reconnect exhausted after %s attempts", account_id, attempts)
+            return
+        delay = RECONNECT_BACKOFF_SECONDS[attempts - 1]
+        self._reconnect_at[account_id] = time.monotonic() + delay
+        log.warning(
+            "account=%s reconnect attempt=%s failed; retry_in_seconds=%s",
+            account_id,
+            attempts,
+            delay,
+        )
+
+    async def start_client(self, acc: Account, *, reset_reconnect: bool = True) -> TelegramClient:
+        if not settings.api_configured:
+            raise RuntimeError(
+                "TG_API_ID / TG_API_HASH are not set in backend/.env — cannot connect.\n"
+                "Get your credentials from https://my.telegram.org and fill them in."
+            )
+        # Serialize against in-flight mutations AND concurrent lifecycle on the
+        # same account. The action lock is taken FIRST so the lock ordering
+        # matches stop_client / run_account_action (action -> lifecycle) and
+        # can never deadlock with a mutation that is tearing this client down.
+        async with self.get_action_lock(acc.id):
+            return await self._start_client_locked(acc, reset_reconnect=reset_reconnect)
+
+    async def _start_client_locked(self, acc: Account, *, reset_reconnect: bool) -> TelegramClient:
+        async with await self._acc_lock(acc.id):
+            if reset_reconnect:
+                self._reset_reconnect(acc.id)
+                self._manual_disconnect.discard(acc.id)
+            cli = self._clients.get(acc.id)
+            if cli and cli.is_connected():
+                await self._set_status(acc.id, "connected")
+                return cli
+            if cli is None:
+                cli = TelegramClient(
+                    self._session_path_for_account(acc),
+                    settings.tg_api_id,
+                    settings.TG_API_HASH,
+                    auto_reconnect=False,
+                )
+            try:
+                await asyncio.wait_for(
+                    cli.connect(), timeout=float(settings.TELEGRAM_CONNECT_TIMEOUT)
+                )
+                authorized = await asyncio.wait_for(
+                    cli.is_user_authorized(), timeout=float(settings.TELEGRAM_AUTH_TIMEOUT)
+                )
+            except asyncio.CancelledError:
+                try:
+                    await cli.disconnect()
+                except Exception:
+                    pass
+                self._clients.pop(acc.id, None)
+                raise
+            except Exception as exc:
+                try:
+                    await cli.disconnect()
+                except Exception:
+                    pass
+                self._clients.pop(acc.id, None)
+                await self._record_connection_failure(acc.id, exc)
+                raise
+            if not authorized:
+                try:
+                    await cli.disconnect()
+                except Exception:
+                    pass
+                self._clients.pop(acc.id, None)
+                self._reconnect_exhausted.add(acc.id)
+                await self._set_status(acc.id, "session_revoked")
+                raise RuntimeError("Session is not authorized")
             self._clients[acc.id] = cli
             self._attach_listener(acc.id, cli)
+            self._reset_reconnect(acc.id)
             await self._set_status(acc.id, "connected")
             # sync profile
             try:
-                me = await cli.get_me()
+                me = await asyncio.wait_for(
+                    cli.get_me(), timeout=float(settings.TELEGRAM_AUTH_TIMEOUT)
+                )
                 await self._sync_profile(acc.id, me)
             except Exception:
                 pass
             # backfill recent 777000 messages we may have missed while offline
             try:
-                await self._backfill_777000(acc.id, cli, limit=50)
+                await asyncio.wait_for(
+                    self._backfill_777000(acc.id, cli, limit=50), timeout=30
+                )
             except Exception as e:
                 log.warning("backfill 777000 for %s: %s", acc.phone, e)
             return cli
 
     async def stop_client(self, account_id: int):
-        lock = await self._acc_lock(account_id)
-        async with lock:
-            cli = self._clients.pop(account_id, None)
-        if cli:
-            try:
-                await cli.disconnect()
-            except Exception:
-                pass
+        # Never disconnect a session while one of its mutations is in flight.
+        async with self.get_action_lock(account_id):
+            lock = await self._acc_lock(account_id)
+            async with lock:
+                cli = self._clients.pop(account_id, None)
+            if cli:
+                handler_entry = self._service_handlers.pop(account_id, None)
+                if handler_entry:
+                    old_cli, handler = handler_entry
+                    with suppress(Exception):
+                        old_cli.remove_event_handler(handler)
+                try:
+                    await cli.disconnect()
+                except Exception:
+                    pass
+
+    async def disconnect_account(self, account_id: int):
+        """User-requested disconnect; auto-reconnect must not undo it."""
+        self._manual_disconnect.add(account_id)
+        self._reset_reconnect(account_id)
+        await self.stop_client(account_id)
+        await self._set_status(account_id, "disconnected")
 
     async def remove_account_instance(self, acc: Account, delete_session_file: bool = True):
         await self.stop_client(acc.id)
@@ -481,26 +879,73 @@ class TgClientManager:
     # passed the code step but need a 2FA password. Keyed by phone.
     # Each entry: { 'client': TelegramClient, 'phone_code_hash': str, 'needs_2fa': bool }
 
+    async def _pending_janitor(self):
+        """Bound abandoned phone/QR login state and clean temporary sessions."""
+        while True:
+            await asyncio.sleep(15)
+            await self.cleanup_expired_pending()
+
+    async def cleanup_expired_pending(self):
+        now = time.monotonic()
+        for phone, entry in list(self._pending.items()):
+            if entry.get('expires_at', 0) <= now:
+                await self._kill_pending(phone)
+        for qr_id, entry in list(self._qr_pending.items()):
+            if entry.get('expires_at', 0) <= now:
+                entry['error'] = entry.get('error') or "QR code expired"
+                await self._close_qr_entry(qr_id, remove=False)
+                # Keep a terminal status briefly for the poller, then evict it.
+                if entry.get('closed_at', now) + 30 <= now:
+                    self._qr_pending.pop(qr_id, None)
+                    self._qr_locks.pop(qr_id, None)
+        completed_ttl = max(30, int(settings.QR_PENDING_TTL_SECONDS))
+        for qr_id, (finished_at, _payload) in list(self._qr_completed.items()):
+            if finished_at + completed_ttl <= now:
+                self._qr_completed.pop(qr_id, None)
+                self._qr_locks.pop(qr_id, None)
+
     async def send_code(self, phone: str) -> str:
-        # If there's a stale pending login for this phone, kill it first
-        prev = self._pending.pop(phone, None)
-        if prev:
-            try: await prev['client'].disconnect()
-            except Exception: pass
-        cli = TelegramClient(self._session_path(phone), settings.TG_API_ID, settings.TG_API_HASH)
-        await asyncio.wait_for(cli.connect(), timeout=20)
-        sent = await asyncio.wait_for(cli.send_code_request(phone), timeout=30)
-        self._pending[phone] = {
-            'client': cli,
-            'phone_code_hash': sent.phone_code_hash,
-            'needs_2fa': False,
-        }
-        return sent.phone_code_hash
+        if not settings.api_configured:
+            raise RuntimeError(
+                "TG_API_ID / TG_API_HASH are not set in backend/.env — cannot request a code.\n"
+                "Get your credentials from https://my.telegram.org and fill them in."
+            )
+        phone = self.normalize_phone(phone)
+        await self.cleanup_expired_pending()
+        lock = self._phone_locks.setdefault(phone, asyncio.Lock())
+        async with lock:
+            if phone in self._pending:
+                raise RuntimeError("A login request is already pending for this phone")
+            session_path = self._phone_temp_session_path(phone)
+            cli = TelegramClient(session_path, settings.tg_api_id, settings.TG_API_HASH)
+            keep = False
+            try:
+                await asyncio.wait_for(
+                    cli.connect(), timeout=float(settings.TELEGRAM_CONNECT_TIMEOUT)
+                )
+                sent = await asyncio.wait_for(cli.send_code_request(phone), timeout=30)
+                self._pending[phone] = {
+                    'client': cli,
+                    'phone_code_hash': sent.phone_code_hash,
+                    'needs_2fa': False,
+                    'authorized': False,
+                    'session_path': session_path,
+                    'expires_at': time.monotonic() + max(30, int(settings.LOGIN_PENDING_TTL_SECONDS)),
+                }
+                keep = True
+                return sent.phone_code_hash
+            finally:
+                if not keep:
+                    with suppress(Exception, asyncio.CancelledError):
+                        await cli.disconnect()
+                    self._remove_session_files(session_path)
 
     async def submit_code(self, phone: str, code: str) -> tuple[TgUser | None, bool]:
         """Returns (user, needs_2fa). If needs_2fa=True, user is None and the
         client is kept alive for a follow-up submit_2fa call."""
         from telethon.errors import SessionPasswordNeededError
+        phone = self.normalize_phone(phone)
+        await self.cleanup_expired_pending()
         pend = self._pending.get(phone)
         if not pend:
             raise RuntimeError("No pending login. Send code first.")
@@ -518,11 +963,17 @@ class TgClientManager:
             await self._kill_pending(phone)
             raise
         me = await cli.get_me()
-        # Code accepted, no 2FA. Disconnect this temp client now that session is saved.
-        await self._kill_pending(phone, disconnect=True)
+        pend['authorized'] = True
+        pend['me'] = me
+        # Keep the disconnected temp file until the transactional DB/session
+        # promotion succeeds; it is bounded by the pending TTL.
+        with suppress(Exception, asyncio.CancelledError):
+            await cli.disconnect()
         return me, False
 
     async def submit_2fa(self, phone: str, password: str) -> TgUser:
+        phone = self.normalize_phone(phone)
+        await self.cleanup_expired_pending()
         pend = self._pending.get(phone)
         if not pend:
             raise RuntimeError("No pending 2FA session. Send code first.")
@@ -538,17 +989,32 @@ class TgClientManager:
             await secrets_store.save_2fa(phone, password)
         except Exception:
             pass
-        await self._kill_pending(phone, disconnect=True)
+        pend['authorized'] = True
+        pend['me'] = me
+        with suppress(Exception, asyncio.CancelledError):
+            await cli.disconnect()
         return me
 
     async def cancel_pending(self, phone: str):
-        await self._kill_pending(phone)
+        await self._kill_pending(self.normalize_phone(phone))
 
-    async def _kill_pending(self, phone: str, disconnect: bool = True):
+    def phone_session_source(self, phone: str) -> str:
+        phone = self.normalize_phone(phone)
+        entry = self._pending.get(phone)
+        if not entry or not entry.get('authorized'):
+            raise RuntimeError("Phone login session is not ready")
+        return entry['session_path']
+
+    async def finish_phone_login(self, phone: str, *, remove_session: bool):
+        await self._kill_pending(self.normalize_phone(phone), remove_session=remove_session)
+
+    async def _kill_pending(self, phone: str, disconnect: bool = True, remove_session: bool = True):
         pend = self._pending.pop(phone, None)
         if pend and disconnect:
-            try: await pend['client'].disconnect()
-            except Exception: pass
+            with suppress(Exception, asyncio.CancelledError):
+                await pend['client'].disconnect()
+        if pend and remove_session:
+            self._remove_session_files(pend.get('session_path', ''))
 
     # ---------- QR login flow ----------
     # Telethon's `qr_login()` returns a QRLogin object. Its `url` field is a
@@ -562,28 +1028,40 @@ class TgClientManager:
 
     async def qr_start(self) -> dict:
         """Begin a new QR login. Returns {qr_id, url, expires_at}."""
+        if not settings.api_configured:
+            raise RuntimeError(
+                "TG_API_ID / TG_API_HASH are not set in backend/.env — cannot start QR login.\n"
+                "Get your credentials from https://my.telegram.org and fill them in."
+            )
         qr_id = secrets.token_urlsafe(12)
         sess_path = self._qr_session_path(qr_id)
-        cli = TelegramClient(sess_path, settings.TG_API_ID, settings.TG_API_HASH)
-        await asyncio.wait_for(cli.connect(), timeout=20)
+        cli = TelegramClient(sess_path, settings.tg_api_id, settings.TG_API_HASH)
+        keep = False
         try:
+            await asyncio.wait_for(
+                cli.connect(), timeout=float(settings.TELEGRAM_CONNECT_TIMEOUT)
+            )
             qr_login = await asyncio.wait_for(cli.qr_login(), timeout=30)
-        except Exception:
-            try: await cli.disconnect()
-            except Exception: pass
-            self._safe_unlink(sess_path + ".session")
-            raise
-        wait_task = asyncio.create_task(self._qr_wait(qr_id))
-        self._qr_pending[qr_id] = {
-            'client': cli,
-            'qr_login': qr_login,
-            'wait_task': wait_task,
-            'needs_2fa': False,
-            'authorized': False,
-            'error': None,
-            'me': None,
-            'session_path': sess_path,
-        }
+            entry = {
+                'client': cli,
+                'qr_login': qr_login,
+                'wait_task': None,
+                'needs_2fa': False,
+                'authorized': False,
+                'error': None,
+                'me': None,
+                'session_path': sess_path,
+                'expires_at': time.monotonic() + max(30, int(settings.QR_PENDING_TTL_SECONDS)),
+                'closed_at': None,
+            }
+            self._qr_pending[qr_id] = entry
+            entry['wait_task'] = asyncio.create_task(self._qr_wait(qr_id))
+            keep = True
+        finally:
+            if not keep:
+                with suppress(Exception, asyncio.CancelledError):
+                    await cli.disconnect()
+                self._remove_session_files(sess_path)
         return {
             'qr_id': qr_id,
             'url': qr_login.url,
@@ -599,37 +1077,69 @@ class TgClientManager:
         qr = entry['qr_login']
         try:
             await qr.wait()
-            # success: client is authorized
-            entry['authorized'] = True
             try:
                 me = await cli.get_me()
                 entry['me'] = me
+                entry['authorized'] = True
             except Exception as e:
-                entry['error'] = f"get_me failed: {e}"
+                entry['error'] = "Could not read Telegram user information"
+                await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
         except SessionPasswordNeededError:
             entry['needs_2fa'] = True
         except asyncio.TimeoutError:
             entry['error'] = "QR code expired"
+            await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            entry['error'] = str(e)
+        except Exception:
+            entry['error'] = "QR login failed"
+            await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
 
     async def qr_recreate(self, qr_id: str) -> dict:
         """Refresh the QR token within an existing pending entry (same client)."""
         entry = self._qr_pending.get(qr_id)
         if not entry:
             raise RuntimeError("QR session not found")
-        cli: TelegramClient = entry['client']
+        await self.cleanup_expired_pending()
+        entry = self._qr_pending.get(qr_id)
+        if not entry:
+            raise RuntimeError("QR session not found")
         # cancel the old wait task before issuing a new qr_login
         old = entry.get('wait_task')
         if old and not old.done():
             old.cancel()
-            try: await old
-            except Exception: pass
-        qr_login = await asyncio.wait_for(cli.qr_login(), timeout=30)
+            with suppress(asyncio.CancelledError):
+                await old
+        cli: TelegramClient = entry['client']
+        if entry.get('closed_at') is not None or not cli.is_connected():
+            with suppress(Exception, asyncio.CancelledError):
+                await cli.disconnect()
+            self._remove_session_files(entry['session_path'])
+            cli = TelegramClient(
+                entry['session_path'], settings.tg_api_id, settings.TG_API_HASH
+            )
+            try:
+                await asyncio.wait_for(
+                    cli.connect(), timeout=float(settings.TELEGRAM_CONNECT_TIMEOUT)
+                )
+            except BaseException:
+                with suppress(Exception, asyncio.CancelledError):
+                    await cli.disconnect()
+                self._remove_session_files(entry['session_path'])
+                raise
+            entry['client'] = cli
+        try:
+            qr_login = await asyncio.wait_for(cli.qr_login(), timeout=30)
+        except BaseException:
+            entry['error'] = "QR login failed"
+            await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
+            raise
         entry['qr_login'] = qr_login
         entry['error'] = None
+        entry['authorized'] = False
+        entry['needs_2fa'] = False
+        entry['closed_at'] = None
+        entry['expires_at'] = time.monotonic() + max(30, int(settings.QR_PENDING_TTL_SECONDS))
         entry['wait_task'] = asyncio.create_task(self._qr_wait(qr_id))
         return {
             'qr_id': qr_id,
@@ -638,6 +1148,10 @@ class TgClientManager:
         }
 
     async def qr_status(self, qr_id: str) -> dict:
+        completed = self._qr_completed.get(qr_id)
+        if completed:
+            return {'state': 'finalized', **completed[1]}
+        await self.cleanup_expired_pending()
         entry = self._qr_pending.get(qr_id)
         if not entry:
             return {'state': 'missing'}
@@ -658,6 +1172,16 @@ class TgClientManager:
         if not entry or not entry['authorized']:
             raise RuntimeError("QR not authorized")
         return entry['me'], entry['client'], entry['session_path']
+
+    def qr_finalize_lock(self, qr_id: str) -> asyncio.Lock:
+        return self._qr_locks.setdefault(qr_id, asyncio.Lock())
+
+    def qr_completed(self, qr_id: str) -> dict | None:
+        item = self._qr_completed.get(qr_id)
+        return item[1] if item else None
+
+    def mark_qr_completed(self, qr_id: str, payload: dict):
+        self._qr_completed[qr_id] = (time.monotonic(), payload)
 
     async def qr_submit_2fa(self, qr_id: str, password: str):
         entry = self._qr_pending.get(qr_id)
@@ -681,37 +1205,44 @@ class TgClientManager:
     async def qr_promote_to_phone(self, qr_id: str, phone: str):
         """Move the QR-temp session file to the canonical acc_<phone>.session
         path and disconnect the temp client. Returns the new path."""
-        entry = self._qr_pending.pop(qr_id, None)
+        entry = self._qr_pending.get(qr_id)
         if not entry:
             raise RuntimeError("QR session not found")
         wait_task = entry.get('wait_task')
         if wait_task and not wait_task.done():
             wait_task.cancel()
-            try: await wait_task
-            except Exception: pass
-        try: await entry['client'].disconnect()
-        except Exception: pass
-        src = entry['session_path']
-        dst = self._session_path(phone)
-        try:
-            self._move_session_files(src, dst)
-            return dst
-        except Exception as e:
-            log.warning("qr session move failed: %s", e)
-            return dst
-    async def qr_cancel(self, qr_id: str):
+            with suppress(asyncio.CancelledError):
+                await wait_task
+        with suppress(Exception, asyncio.CancelledError):
+            await entry['client'].disconnect()
+        return entry['session_path']
+
+    async def finish_qr(self, qr_id: str, *, remove_session: bool):
         entry = self._qr_pending.pop(qr_id, None)
+        if entry and remove_session:
+            self._remove_session_files(entry.get('session_path', ''))
+
+    async def _close_qr_entry(
+        self, qr_id: str, *, remove: bool, cancel_wait: bool = True
+    ):
+        entry = self._qr_pending.get(qr_id)
         if not entry:
             return
         wait_task = entry.get('wait_task')
-        if wait_task and not wait_task.done():
+        current = asyncio.current_task()
+        if cancel_wait and wait_task and wait_task is not current and not wait_task.done():
             wait_task.cancel()
-            try: await wait_task
-            except Exception: pass
-        try: await entry['client'].disconnect()
-        except Exception: pass
-        # Only remove the temp session file if not yet promoted
-        self._safe_unlink(entry['session_path'] + ".session")
+            with suppress(asyncio.CancelledError):
+                await wait_task
+        with suppress(Exception, asyncio.CancelledError):
+            await entry['client'].disconnect()
+        self._remove_session_files(entry.get('session_path', ''))
+        entry['closed_at'] = entry.get('closed_at') or time.monotonic()
+        if remove:
+            self._qr_pending.pop(qr_id, None)
+
+    async def qr_cancel(self, qr_id: str):
+        await self._close_qr_entry(qr_id, remove=True)
 
     @staticmethod
     def _safe_unlink(path: str):
@@ -724,12 +1255,19 @@ class TgClientManager:
 
     # ---------- listener ----------
     def _attach_listener(self, account_id: int, cli: TelegramClient):
-        @cli.on(events.NewMessage(from_users=SERVICE_ID))
+        previous = self._service_handlers.pop(account_id, None)
+        if previous:
+            old_cli, old_handler = previous
+            with suppress(Exception):
+                old_cli.remove_event_handler(old_handler)
+
         async def _handler(event):
             try:
                 text = event.message.message or ""
                 msg_id = event.message.id
                 m_type = classify_777000(text)
+                if m_type == "login_code":
+                    text = redact_login_code(text)
                 async with AsyncSessionLocal() as db:
                     sm = SecurityMessage(
                         account_id=account_id,
@@ -740,7 +1278,11 @@ class TgClientManager:
                         received_at=datetime.utcnow(),
                     )
                     db.add(sm)
-                    await db.commit()
+                    try:
+                        await db.commit()
+                    except IntegrityError:
+                        await db.rollback()
+                        return
                     await db.refresh(sm)
                 # notify pub/sub
                 for cb in list(self._new_msg_callbacks):
@@ -756,6 +1298,8 @@ class TgClientManager:
                         pass
             except Exception as e:
                 log.exception("777000 handler failed: %s", e)
+        cli.add_event_handler(_handler, events.NewMessage(from_users=SERVICE_ID))
+        self._service_handlers[account_id] = (cli, _handler)
 
     def subscribe_new_messages(self, cb):
         self._new_msg_callbacks.append(cb)
@@ -823,6 +1367,8 @@ class TgClientManager:
                 if not text:
                     continue
                 m_type = classify_777000(text)
+                if m_type == "login_code":
+                    text = redact_login_code(text)
                 async with AsyncSessionLocal() as db:
                     sm = SecurityMessage(
                         account_id=account_id,
@@ -833,7 +1379,11 @@ class TgClientManager:
                         received_at=msg.date.replace(tzinfo=None) if msg.date else datetime.utcnow(),
                     )
                     db.add(sm)
-                    await db.commit()
+                    try:
+                        await db.commit()
+                    except IntegrityError:
+                        await db.rollback()
+                        continue
                 added += 1
         except Exception as e:
             log.warning("backfill iter failed for account %s: %s", account_id, e)
@@ -841,22 +1391,140 @@ class TgClientManager:
             log.info("backfilled %d 777000 messages for account %s", added, account_id)
 
     async def refresh_status_all(self):
+        """Lightweight pass: check TCP/session connection state and schedule
+        reconnects. The expensive per-account ``is_user_authorized()`` call is
+        spread out in `verify_authorizations_all()` so it is never done for every
+        account on every 5s tick — that would burst auth RPCs as the fleet grows.
+        """
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(select(Account))
+            accounts = list(res.scalars().all())
+        by_id = {acc.id: acc for acc in accounts}
+
+        # Cheap per-tick check: is the socket layer still connected?
         for aid, cli in list(self._clients.items()):
             try:
                 if not cli.is_connected():
-                    await cli.connect()
-                ok = await cli.is_user_authorized()
-                await self._set_status(aid, "connected" if ok else "disconnected")
-            except (UserDeactivatedBanError, UserDeactivatedError):
-                # Real, permanent ban/deactivation — drop into Gone/Banned history
-                # and stop polling the dead client so we don't re-hit this every 30s.
-                await self._mark_banned(aid)
-                await self.stop_client(aid)
-            except AuthKeyUnregisteredError:
-                # Session expired/revoked — recoverable by reconnecting, NOT a ban.
+                    await self._set_status(aid, "disconnected")
+            except Exception as exc:
                 await self._set_status(aid, "disconnected")
+                if self._permanent_status(exc):
+                    await self._record_connection_failure(aid, exc)
+
+        if not self.auto_reconnect:
+            return
+
+        now = time.monotonic()
+        due: list[tuple[int, Account]] = []
+        for aid, acc in by_id.items():
+            cli = self._clients.get(aid)
+            if cli and cli.is_connected():
+                continue
+            if acc.status in {"banned", "session_revoked", "auth_error"}:
+                continue
+            if aid in self._reconnect_exhausted:
+                continue
+            if aid in self._manual_disconnect:
+                continue
+            retry_at = self._reconnect_at.get(aid)
+            if retry_at is None:
+                # A detected disconnect waits 5s before reconnect attempt #1.
+                self._reconnect_attempts.setdefault(aid, 1)
+                self._reconnect_at[aid] = now + RECONNECT_BACKOFF_SECONDS[0]
+                continue
+            if retry_at > now:
+                continue
+            due.append((aid, acc))
+
+        async def _reconnect_one(aid: int, acc: Account):
+            await self._set_status(aid, "connecting")
+            try:
+                await asyncio.wait_for(
+                    self.start_client(acc, reset_reconnect=False), timeout=75
+                )
+                # A successful reconnect re-arms the auth-verify throttle.
+                self._last_auth_check[aid] = time.monotonic()
+            except Exception as exc:
+                log.warning(
+                    "account=%s reconnect failed error=%s",
+                    aid,
+                    type(exc).__name__,
+                )
+        if due:
+            await asyncio.gather(*(_reconnect_one(aid, acc) for aid, acc in due))
+
+    async def verify_authorizations_all(self) -> int:
+        """Expensive verification (`is_user_authorized()`) for connected clients,
+        throttled per account to at most once per STATUS_AUTH_INTERVAL and
+        staggered across ticks so a large fleet never bursts auth RPCs at once.
+
+        A rotating cursor spreads the work: each tick verifies only a slice of
+        the connected fleet (interval/poll fraction), so a full pass takes about
+        STATUS_AUTH_INTERVAL and each account is verified roughly every interval.
+        Returns how many accounts were verified this tick.
+        """
+        interval = max(30.0, float(getattr(settings, "STATUS_AUTH_INTERVAL", 60.0)))
+        poll = max(0.1, float(getattr(settings, "STATUS_POLL_SECS", 5.0)))
+        now = time.monotonic()
+
+        connected_ids: list[int] = []
+        for aid, cli in list(self._clients.items()):
+            try:
+                ok = cli.is_connected()
             except Exception:
-                await self._set_status(aid, "disconnected")
+                ok = False
+            if ok:
+                connected_ids.append(aid)
+            else:
+                # Auth can't be verified on a dead socket; re-arm so a freshly
+                # reconnected account is verified promptly on the next slice.
+                self._last_auth_check.pop(aid, None)
+
+        if not connected_ids:
+            return 0
+
+        slice_n = max(1, int(round(interval / poll)))
+        cursor = self._auth_cursor
+        self._auth_cursor = (cursor + 1) % max(slice_n, 1)
+        batch = [aid for aid in connected_ids[cursor::slice_n]
+                 if (now - self._last_auth_check.get(aid, 0.0)) >= interval]
+
+        verified = 0
+        for aid in batch:
+            cli = self._clients.get(aid)
+            if not cli:
+                continue
+            try:
+                ok = await asyncio.wait_for(
+                    cli.is_user_authorized(), timeout=float(settings.TELEGRAM_AUTH_TIMEOUT)
+                )
+            except (UserDeactivatedBanError, UserDeactivatedError):
+                await self._mark_banned(aid)
+                self._reconnect_exhausted.add(aid)
+                await self.stop_client(aid)
+                self._last_auth_check[aid] = now
+                continue
+            except AuthKeyUnregisteredError:
+                await self._set_status(aid, "session_revoked")
+                self._reconnect_exhausted.add(aid)
+                await self.stop_client(aid)
+                self._last_auth_check[aid] = now
+                continue
+            except Exception:
+                # Transient RPC failure — simply try again on a later slice.
+                continue
+
+            self._last_auth_check[aid] = now
+            if ok:
+                await self._set_status(aid, "connected")
+                self._reset_reconnect(aid)
+            else:
+                await self._set_status(aid, "session_revoked")
+                self._reconnect_exhausted.add(aid)
+                await self.stop_client(aid)
+            verified += 1
+
+        return verified
 
 
 manager = TgClientManager()

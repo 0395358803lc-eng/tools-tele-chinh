@@ -1,7 +1,9 @@
-import { useState, useRef, useMemo } from 'react'
+import { useEffect, useState, useRef, useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
 import { Endpoints } from '../lib/api'
 import { useToast } from '../lib/toast.jsx'
 import ProgressModal from '../components/ProgressModal.jsx'
+import ConfirmModal from '../components/ConfirmModal.jsx'
 import { useBulkProgress } from '../lib/useBulkProgress'
 
 // Parse CSV/TXT: each line = "firstname,lastname,username,bio".
@@ -25,6 +27,7 @@ function parseCsv(text) {
 }
 
 export default function BulkTab({ accounts, onDone }) {
+  const { t } = useTranslation()
   const toast = useToast()
   const { progress, run, close } = useBulkProgress()
   const [ids, setIds] = useState([])
@@ -42,6 +45,7 @@ export default function BulkTab({ accounts, onDone }) {
   const [photos, setPhotos] = useState([])    // File[]
   const photoRef = useRef(null)
   const [busy, setBusy] = useState(false)
+  const [pending, setPending] = useState(null)
 
   const allChecked = ids.length === accounts.length && accounts.length > 0
   const toggleAll = () => setIds(allChecked ? [] : accounts.map((a) => a.id))
@@ -54,26 +58,36 @@ export default function BulkTab({ accounts, onDone }) {
     reader.onload = () => {
       const rows = parseCsv(String(reader.result || ''))
       setCsvRows(rows)
-      toast.info(`Loaded ${rows.length} CSV rows`)
+      toast.info(t('bulk.loadedCsvRows', { count: rows.length }))
     }
-    reader.onerror = () => toast.error('Failed to read CSV file')
+    reader.onerror = () => toast.error(t('bulk.csvReadFail'))
     reader.readAsText(file)
     if (csvRef.current) csvRef.current.value = ''
   }
   function clearCsv() { setCsvRows([]) }
 
   async function applyProfile() {
-    if (ids.length === 0) { toast.error('Pick accounts'); return }
+    if (ids.length === 0) { toast.error(t('bulk.pickAccounts1')); return }
     const usingCsv = csvRows.length > 0
     if (!usingCsv && !firstName && !lastName && !username && bio === '') {
-      toast.error('Set at least one field, or load a CSV')
+      toast.error(t('bulk.setFieldOrCsv'))
       return
     }
     if (!usingCsv && username && !appendNumber && ids.length > 1) {
-      toast.error('Username must be unique. Enable "Append number" or use CSV for multiple accounts.')
+      toast.error(t('bulk.usernameUnique'))
       return
     }
-    if (!confirm(`Apply profile changes to ${ids.length} accounts?` + (usingCsv ? ` (CSV will map first ${Math.min(ids.length, csvRows.length)} rows)` : ''))) return
+    setPending({
+      title: t('bulk.bulkProfileTitle', { count: ids.length }),
+      message: t('bulk.applyProfileConfirm', {
+        count: ids.length,
+        csv: usingCsv ? t('bulk.csvMapsRows', { count: Math.min(ids.length, csvRows.length) }) : '',
+      }),
+      onYes: () => doApplyProfile(usingCsv),
+    })
+  }
+
+  async function doApplyProfile(usingCsv) {
     let per_account = null
     if (usingCsv) {
       per_account = {}
@@ -99,7 +113,7 @@ export default function BulkTab({ accounts, onDone }) {
       per_account,
     }
     setBusy(true)
-    await run(`Bulk Profile (${ids.length} accounts)`, (onEvent) => Endpoints.bulkProfile(payload, onEvent))
+    await run(t('bulk.bulkProfileTitle', { count: ids.length }), (onEvent) => Endpoints.bulkProfile(payload, onEvent))
     setBusy(false)
     onDone?.()
   }
@@ -110,7 +124,7 @@ export default function BulkTab({ accounts, onDone }) {
     if (!list.length) return
     setPhotos((cur) => [...cur, ...list])
     if (photoRef.current) photoRef.current.value = ''  // allow re-picking same files
-    toast.info(`Added ${list.length} photos (total ${photos.length + list.length})`)
+    toast.info(t('bulk.addedPhotos', { count: list.length, total: photos.length + list.length }))
   }
   function removePhoto(i) { setPhotos((cur) => cur.filter((_, j) => j !== i)) }
   function clearPhotos() { setPhotos([]) }
@@ -119,16 +133,26 @@ export default function BulkTab({ accounts, onDone }) {
     () => photos.map((f) => ({ name: f.name, size: f.size, url: URL.createObjectURL(f) })),
     [photos]
   )
+  useEffect(() => () => {
+    photoThumbs.forEach((photo) => URL.revokeObjectURL(photo.url))
+  }, [photoThumbs])
 
   async function applyPhoto() {
-    if (photos.length === 0) { toast.error('Pick at least one photo'); return }
-    if (ids.length === 0) { toast.error('Pick accounts'); return }
+    if (photos.length === 0) { toast.error(t('bulk.pickPhoto')); return }
+    if (ids.length === 0) { toast.error(t('bulk.pickAccounts1')); return }
     const usable = Math.min(photos.length, ids.length)
-    const extra = photos.length > ids.length ? ` (${photos.length - ids.length} extra photos ignored)` : ''
-    const missing = ids.length > photos.length ? ` (${ids.length - photos.length} accounts skipped, no photo)` : ''
-    if (!confirm(`Apply ${usable} photo(s) to ${ids.length} accounts in order?${extra}${missing}`)) return
+    const extra = photos.length > ids.length ? t('bulk.extraPhotos', { count: photos.length - ids.length }) : ''
+    const missing = ids.length > photos.length ? t('bulk.missingPhotos', { count: ids.length - photos.length }) : ''
+    setPending({
+      title: t('bulk.bulkPhotoTitle', { usable, count: ids.length }),
+      message: t('bulk.applyPhotosConfirm', { usable, count: ids.length, extra, missing }),
+      onYes: () => doApplyPhoto(usable),
+    })
+  }
+
+  async function doApplyPhoto(usable) {
     setBusy(true)
-    await run(`Bulk Photo (${usable} of ${ids.length})`, (onEvent) => Endpoints.bulkPhoto(ids, photos, onEvent))
+    await run(t('bulk.bulkPhotoTitle', { usable, count: ids.length }), (onEvent) => Endpoints.bulkPhoto(ids, photos, onEvent))
     setBusy(false)
     onDone?.()
   }
@@ -137,59 +161,58 @@ export default function BulkTab({ accounts, onDone }) {
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
       <div className="lg:col-span-2 space-y-4">
         <div className="nb-card p-4">
-          <h3 className="font-extrabold uppercase mb-3">Bulk Profile Edit</h3>
+          <h3 className="font-extrabold uppercase mb-3">{t('bulk.bulkProfileEdit')}</h3>
 
           <div className="nb-card-sm p-3 mb-3 bg-zinc-50 dark:bg-zinc-800">
-            <div className="text-xs font-bold uppercase mb-2">CSV / TXT import (optional)</div>
+            <div className="text-xs font-bold uppercase mb-2">{t('bulk.csvImport')}</div>
             <div className="flex items-center gap-2 flex-wrap">
               <input ref={csvRef} type="file" accept=".csv,.txt" onChange={loadCsv}
-                className="text-xs file:nb-btn file:!py-1 file:!px-2" />
+                className="text-xs file:mr-2 file:cursor-pointer file:border-2 file:border-black file:bg-white file:px-2 file:py-1 file:font-bold file:uppercase" />
               {csvRows.length > 0 && (
                 <>
-                  <span className="text-xs font-bold">{csvRows.length} rows loaded</span>
-                  <button className="nb-btn !py-0.5 !px-2 text-xs" onClick={clearCsv}>Clear</button>
+                  <span className="text-xs font-bold">{t('bulk.rowsLoaded', { count: csvRows.length })}</span>
+                  <button className="nb-btn !py-0.5 !px-2 text-xs" onClick={clearCsv}>{t('common.clear')}</button>
                 </>
               )}
             </div>
             <div className="text-[10px] opacity-60 mt-1">
-              Format: each line = <code>firstname,lastname,username,bio</code> (tab or comma). Row N applies to selected account N.
-              Any field can be blank to skip it. <b>Username must be unique</b> per account (Telegram rule) — taken ones are reported per account.
-              {csvRows.length > 0 && firstName === '' && lastName === '' && bio === '' ? '' : ' When CSV is loaded, the fields below are ignored.'}
+              {t('bulk.csvFormat')}
+              {csvRows.length > 0 && firstName === '' && lastName === '' && bio === '' ? '' : t('bulk.csvIgnoresFields')}
             </div>
             {csvRows.length > 0 && (
               <div className="mt-2 max-h-32 overflow-auto text-xs font-mono opacity-80">
                 {csvRows.slice(0, 5).map((r, i) => (
                   <div key={i}>{i + 1}. {r.first_name} | {r.last_name} | {r.username ? '@' + r.username : '—'} | {r.bio.slice(0, 40)}</div>
                 ))}
-                {csvRows.length > 5 && <div>... +{csvRows.length - 5} more</div>}
+                {csvRows.length > 5 && <div>{t('common.more', { count: csvRows.length - 5 })}</div>}
               </div>
             )}
           </div>
 
           <div className={'grid grid-cols-2 gap-3 ' + (csvRows.length > 0 ? 'opacity-50 pointer-events-none' : '')}>
             <label>
-              <div className="text-xs font-bold uppercase mb-1">First Name (same for all)</div>
-              <input className="nb-input" value={firstName} onChange={(e) => setFirstName(e.target.value)} placeholder="leave blank to skip" />
+              <div className="text-xs font-bold uppercase mb-1">{t('bulk.firstNameAll')}</div>
+              <input className="nb-input" value={firstName} onChange={(e) => setFirstName(e.target.value)} placeholder={t('bulk.leaveBlank')} />
             </label>
             <label>
-              <div className="text-xs font-bold uppercase mb-1">Last Name (same for all)</div>
-              <input className="nb-input" value={lastName} onChange={(e) => setLastName(e.target.value)} placeholder="leave blank to skip" />
+              <div className="text-xs font-bold uppercase mb-1">{t('bulk.lastNameAll')}</div>
+              <input className="nb-input" value={lastName} onChange={(e) => setLastName(e.target.value)} placeholder={t('bulk.leaveBlank')} />
             </label>
             <label className="col-span-2">
-              <div className="text-xs font-bold uppercase mb-1">Username (without @)</div>
-              <input className="nb-input" value={username} onChange={(e) => setUsername(e.target.value)} placeholder="leave blank to skip" />
+              <div className="text-xs font-bold uppercase mb-1">{t('bulk.usernameNoAt')}</div>
+              <input className="nb-input" value={username} onChange={(e) => setUsername(e.target.value)} placeholder={t('bulk.leaveBlank')} />
               <div className="text-[10px] opacity-60 mt-1">
-                Must be unique per account. Use "Append number" below to auto-generate (e.g., myuser1, myuser2), or use CSV for custom usernames.
+                {t('bulk.usernameUniqueHint')}
               </div>
             </label>
             <label className="col-span-2">
-              <div className="text-xs font-bold uppercase mb-1">Bio (max 70)</div>
-              <textarea maxLength={70} className="nb-input" value={bio} onChange={(e) => setBio(e.target.value)} placeholder="leave blank to skip" />
+              <div className="text-xs font-bold uppercase mb-1">{t('bulk.bioMax')}</div>
+              <textarea maxLength={70} className="nb-input" value={bio} onChange={(e) => setBio(e.target.value)} placeholder={t('bulk.leaveBlank')} />
             </label>
           </div>
           <label className={'flex items-center gap-2 mt-3 ' + (csvRows.length > 0 ? 'opacity-50 pointer-events-none' : '')}>
             <input type="checkbox" checked={appendNumber} onChange={(e) => setAppendNumber(e.target.checked)} />
-            <span className="text-sm">Append number to first/last name{username ? ' and username' : ''} (e.g. "Family 1", "Family 2"{username ? `, "${username}1", "${username}2"` : ''})</span>
+            <span className="text-sm">{t('bulk.appendNumber', { un: username ? ' + ' + t('profile.username') : '', u: username ? ` / "${username}1", "${username}2"` : '' })}</span>
             {appendNumber && (
               <input type="number" min={1} className="nb-input !w-20 !py-1" value={startNumber}
                 onChange={(e) => setStartNumber(Number(e.target.value) || 1)} />
@@ -197,33 +220,33 @@ export default function BulkTab({ accounts, onDone }) {
           </label>
 
           <button className="nb-btn-pri mt-3" disabled={busy} onClick={applyProfile}>
-            Apply Profile to {ids.length}
+            {t('bulk.applyProfileBtn', { count: ids.length })}
             {csvRows.length > 0 && ids.length > 0 && (
-              <span className="ml-1 opacity-70">(using CSV — {Math.min(ids.length, csvRows.length)} mapped)</span>
+              <span className="ml-1 opacity-70">{t('bulk.usingCsv', { count: Math.min(ids.length, csvRows.length) })}</span>
             )}
           </button>
         </div>
 
         <div className="nb-card p-4">
-          <h3 className="font-extrabold uppercase mb-3">Bulk Profile Photo</h3>
+          <h3 className="font-extrabold uppercase mb-3">{t('bulk.bulkProfilePhoto')}</h3>
           <div className="flex items-center gap-2 mb-3 flex-wrap">
             <input ref={photoRef} type="file" accept="image/*" multiple onChange={addPhotos}
-              className="text-xs file:nb-btn file:!py-1 file:!px-2" />
+              className="text-xs file:mr-2 file:cursor-pointer file:border-2 file:border-black file:bg-white file:px-2 file:py-1 file:font-bold file:uppercase" />
             <button className="nb-btn !py-1 !px-2 text-xs" disabled={photos.length === 0} onClick={clearPhotos}>
-              Clear all
+              {t('bulk.clearAll')}
             </button>
             <div className="text-xs ml-auto">
-              <span className="font-bold">{photos.length}</span> photos •{' '}
-              <span className="font-bold">{ids.length}</span> accounts
+              <span className="font-bold">{t('bulk.photos', { count: photos.length })}</span> •{' '}
+              <span className="font-bold">{ids.length}</span> {t('bulk.accounts')}
               {photos.length > 0 && ids.length > 0 && (
                 <span className={'ml-2 nb-badge text-black ' + (photos.length >= ids.length ? 'bg-brand-ok' : 'bg-brand-warn')}>
-                  {photos.length >= ids.length ? 'enough' : `need ${ids.length - photos.length} more`}
+                  {photos.length >= ids.length ? t('bulk.enough') : t('bulk.needMore', { count: ids.length - photos.length })}
                 </span>
               )}
             </div>
           </div>
           <div className="text-[11px] opacity-70 mb-2">
-            Pick photos in batches (click "Choose Files" repeatedly to accumulate). Photo #1 → account #1, photo #2 → account #2, etc. Extra photos are ignored; if there are fewer photos than accounts, the remaining accounts are skipped.
+            {t('bulk.photoHint')}
           </div>
           {photos.length > 0 && (
             <div className="grid grid-cols-6 sm:grid-cols-8 gap-2 mb-3 max-h-72 overflow-auto p-2 bg-zinc-50 dark:bg-zinc-800 border-2 border-black dark:border-white">
@@ -240,19 +263,19 @@ export default function BulkTab({ accounts, onDone }) {
             </div>
           )}
           <button className="nb-btn-pri" disabled={busy || photos.length === 0 || ids.length === 0} onClick={applyPhoto}>
-            Apply Photos to {Math.min(photos.length, ids.length)} of {ids.length} accounts
+            {t('bulk.applyPhotosBtn', { a: Math.min(photos.length, ids.length), b: ids.length })}
           </button>
         </div>
       </div>
 
       <div className="nb-card p-4 h-fit">
-        <h3 className="font-extrabold uppercase mb-3">Pick Accounts</h3>
+        <h3 className="font-extrabold uppercase mb-3">{t('bulk.pickAccounts')}</h3>
         <label className="flex items-center gap-2 mb-2">
           <input type="checkbox" checked={allChecked} onChange={toggleAll} />
-          <span className="font-bold text-sm">Select all ({accounts.length})</span>
+          <span className="font-bold text-sm">{t('common.selectAll')} ({accounts.length})</span>
         </label>
         <div className="text-[10px] opacity-60 mb-2">
-          Order matters: row N of CSV / photo #N → account #N (top to bottom of this list).
+          {t('bulk.orderMatters')}
         </div>
         <div className="space-y-1 max-h-[60vh] overflow-auto">
           {accounts.map((a, i) => (
@@ -267,6 +290,18 @@ export default function BulkTab({ accounts, onDone }) {
       </div>
 
       <ProgressModal progress={progress} onClose={close} />
+
+      {pending && (
+        <ConfirmModal
+          title={pending.title}
+          message={pending.message}
+          confirmLabel={t('common.yes')}
+          cancelLabel={t('common.no')}
+          danger
+          onConfirm={() => { const f = pending.onYes; setPending(null); f && f() }}
+          onCancel={() => setPending(null)}
+        />
+      )}
     </div>
   )
 }

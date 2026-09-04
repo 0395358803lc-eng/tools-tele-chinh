@@ -9,6 +9,34 @@
 
 </div>
 
+## Windows runtime data
+
+Run `START.bat`. Production releases include the built frontend, so end users
+do not need Node.js. Runtime data is isolated from source code:
+
+```text
+data/
+  database/app.db
+  sessions/*.session
+  secrets/twofa.bin
+  backups/<timestamp>/
+  logs/app.log
+```
+
+Legacy files under `backend/` are copied into this layout without deleting the
+originals. Create backups from Settings. To restore, stop the app and run
+`RESTORE_BACKUP.bat`; it creates another safety backup before replacing data.
+The encrypted 2FA store remains tied to its Windows DPAPI user context.
+
+Run automated tests with:
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Create a sanitized Windows release with `BUILD_RELEASE.bat`.
+
 <div align="center">
 <i>A private local dashboard for account status, profile edits, groups, messages, security alerts, and bulk Telegram account actions.</i>
 </div>
@@ -19,7 +47,7 @@
 
 | Feature | What it does |
 | --- | --- |
-| One-click Windows start | `start.bat` creates the venv, installs packages, builds the frontend, and opens the app. |
+| One-click Windows start | `start.bat` creates the venv, installs the exact lockfile, serves the bundled frontend, and opens the app. |
 | Local-only server | Runs on `127.0.0.1`, so the dashboard is not exposed to the internet. |
 | Telegram sessions | Uses Telethon session files stored inside the backend folder. |
 | Bulk tools | Bulk names, bios, profile photos, joins, leaves, message actions, and security checks. |
@@ -31,12 +59,10 @@
 
 ```text
 1. Install Python 3.10+ from https://python.org and tick Add Python to PATH.
-2. Install Node.js 18+ from https://nodejs.org.
-3. Download this repo as ZIP or run: git clone https://github.com/0xnurrabby/multi-tg-manager.git
-4. Open the folder.
-5. Double-click start.bat.
-6. Fill backend\.env when Notepad opens.
-7. Save, close Notepad, and double-click start.bat again.
+2. Download a release ZIP (Node.js is not required for releases).
+3. Open the folder and double-click start.bat.
+4. Fill backend\.env when Notepad opens.
+5. Save, close Notepad, and double-click start.bat again.
 ```
 
 The app opens at `http://localhost:8000`.
@@ -50,18 +76,17 @@ Fill these values in `backend/.env`:
 ```env
 TG_API_ID=your_api_id_from_my_telegram_org
 TG_API_HASH=your_api_hash_from_my_telegram_org
-APP_PASSWORD=change_me_to_a_long_password
-SESSION_SECRET=auto_generated_by_start_bat
-SESSIONS_DIR=./sessions
-DB_URL=sqlite+aiosqlite:///./app.db
+APP_PASSWORD=use_a_unique_password_of_12_to_256_characters
+SESSION_SECRET=auto_generated_by_start_bat_minimum_48_characters
 ```
 
 To check your new PC setup:
 
 ```powershell
 python --version
-node --version
 ```
+
+Building from source additionally requires Node.js 20.19+ (or 22.12+).
 
 ---
 
@@ -72,7 +97,7 @@ multi-tg-manager/
   start.bat              -> first-run setup and server launcher
   stop.bat               -> stops the local server on port 8000
   backend/               -> FastAPI app, SQLite DB, sessions, env
-  backend/requirements.txt -> Python dependencies
+  backend/requirements.lock -> exact Python dependency set used by start.bat
   frontend/              -> React and Vite dashboard
   frontend/package.json  -> frontend scripts
 ```

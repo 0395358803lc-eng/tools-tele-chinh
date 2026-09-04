@@ -1,8 +1,24 @@
 const BASE = ''  // proxied by vite
 
+import i18n from '../i18n'
+import { errText } from './err'
+
 // listeners notified when any request returns 401
 const _onUnauth = new Set()
 export function onUnauthorized(cb) { _onUnauth.add(cb); return () => _onUnauth.delete(cb) }
+
+// Localize an API error message. `msg` is the raw detail text and `body` may
+// carry `error_code`/`error_params` from the backend. Also maps the frontend's
+// own "Cannot reach server" string (it has a literal errors.* key).
+function localizeApiError(msg, body) {
+  if (body) {
+    const localized = errText(msg, body.error_code, body.error_params)
+    if (localized !== msg) return localized
+  }
+  const known = i18n.exists('errors.' + msg)
+  if (known) return i18n.t('errors.' + msg)
+  return msg
+}
 
 async function request(method, path, { json, form, query, silent } = {}) {
   let url = path
@@ -24,7 +40,7 @@ async function request(method, path, { json, form, query, silent } = {}) {
     r = await fetch(BASE + url, opts)
   } catch (netErr) {
     // network/CORS/abort — surface a cleaner message
-    const e = new Error('Cannot reach server')
+    const e = new Error(localizeApiError('Cannot reach server'))
     e.status = 0
     e.network = true
     throw e
@@ -36,7 +52,7 @@ async function request(method, path, { json, form, query, silent } = {}) {
   }
   if (!r.ok) {
     const msg = body?.detail || body?.message || `${r.status} ${r.statusText}`
-    const err = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg))
+    const err = new Error(localizeApiError(typeof msg === 'string' ? msg : JSON.stringify(msg), body))
     err.status = r.status
     err.body = body
     throw err
@@ -60,13 +76,14 @@ async function streamRequest(path, init, onEvent) {
   try {
     r = await fetch(BASE + path, { credentials: 'include', ...init })
   } catch {
-    const e = new Error('Cannot reach server'); e.status = 0; e.network = true; throw e
+    const e = new Error(localizeApiError('Cannot reach server')); e.status = 0; e.network = true; throw e
   }
   if (r.status === 401) _onUnauth.forEach((fn) => { try { fn() } catch {} })
   if (!r.ok || !r.body) {
     let detail = `${r.status} ${r.statusText}`
-    try { const b = await r.json(); detail = b?.detail || detail } catch { /* not json */ }
-    const err = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
+    let body = null
+    try { body = await r.json(); detail = body?.detail || detail } catch { /* not json */ }
+    const err = new Error(localizeApiError(typeof detail === 'string' ? detail : JSON.stringify(detail), body))
     err.status = r.status
     throw err
   }
@@ -112,6 +129,10 @@ export const Endpoints = {
   stats: () => api.get('/api/stats'),
   accounts: () => api.get('/api/accounts'),
   account: (id) => api.get(`/api/accounts/${id}`),
+  connectAccount: (id) => api.post(`/api/accounts/${id}/connect`),
+  disconnectAccount: (id) => api.post(`/api/accounts/${id}/disconnect`),
+  connectAll: () => api.post('/api/accounts/connect_all'),
+  disconnectAll: () => api.post('/api/accounts/disconnect_all'),
   deleteAccount: (id) => api.del(`/api/accounts/${id}`),
   removeAllAccounts: (password) => api.post('/api/accounts/remove_all', { password }),
 
@@ -208,6 +229,11 @@ export const Endpoints = {
   getSettings: () => api.get('/api/settings'),
   putSettings: (s) => api.put('/api/settings', s),
   exportJson: () => api.get('/api/settings/export'),
+  createBackup: () => api.post('/api/settings/backup'),
+  backups: () => api.get('/api/settings/backups'),
+  diagnostics: () => api.get('/api/settings/diagnostics'),
+  logs: (limit = 100, errors_only = false) => api.get('/api/settings/logs', { limit, errors_only }),
+  openLogFolder: () => api.post('/api/settings/logs/open-folder'),
 
   // app auth
   me:     () => api.get('/api/auth-app/me'),
