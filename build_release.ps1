@@ -57,6 +57,7 @@ foreach ($Name in $OptionalRootFiles) {
     }
 }
 Copy-Item (Join-Path $Root "backend\restore_backup.py") (Join-Path $Target "backend\restore_backup.py")
+Copy-Item (Join-Path $Root "backend\soak_scheduler.py") (Join-Path $Target "backend\soak_scheduler.py")
 Copy-Item (Join-Path $Root "README.md") (Join-Path $Target "README.md")
 Copy-Item (Join-Path $Root "LICENSE") (Join-Path $Target "LICENSE")
 Copy-Item (Join-Path $Root "backend\check_requirements.py") (Join-Path $Target "backend\check_requirements.py")
