@@ -229,12 +229,18 @@ async def migrate_legacy():
         if src.exists():
             incoming = _clean_mapping(json.loads(src.read_text(encoding="utf-8") or "{}"))
             # Existing encrypted values win over stale legacy values for the same
-            # phone, while legacy-only entries are preserved.
+            # phone, while legacy-only entries are preserved. If the two stores
+            # disagree for a phone, keep the plaintext source after the merge:
+            # that conflicting value is not proven to exist in the secure store.
+            conflicts = {
+                key for key, value in incoming.items()
+                if key in existing and existing[key] != value
+            }
             merged = {**incoming, **existing}
             async with _lock:
                 _write(merged)
                 back = _read()
-                if back == merged:
+                if back == merged and not conflicts:
                     src.unlink(missing_ok=True)
                     _remove_legacy_plaintext_if_covered(back)
         elif existing:
