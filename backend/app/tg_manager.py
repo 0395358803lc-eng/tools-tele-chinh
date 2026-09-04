@@ -966,7 +966,12 @@ class TgClientManager:
                 me = await cli.get_me()
                 entry['me'] = me
                 entry['authorized'] = True
-            except Exception as e:
+            except Exception as exc:
+                log.warning(
+                    "QR login user lookup failed qr_id=%s error=%s",
+                    qr_id,
+                    type(exc).__name__,
+                )
                 entry['error'] = "Could not read Telegram user information"
                 await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
         except SessionPasswordNeededError:
@@ -976,7 +981,12 @@ class TgClientManager:
             await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            log.warning(
+                "QR login wait failed qr_id=%s error=%s",
+                qr_id,
+                type(exc).__name__,
+            )
             entry['error'] = "QR login failed"
             await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
 
@@ -1298,7 +1308,12 @@ class TgClientManager:
             try:
                 if not cli.is_connected():
                     await self._set_status(aid, "disconnected")
-            except Exception as exc:
+            except (OSError, RuntimeError) as exc:
+                log.debug(
+                    "account=%s connection-state probe failed error=%s",
+                    aid,
+                    type(exc).__name__,
+                )
                 await self._set_status(aid, "disconnected")
                 if self._permanent_status(exc):
                     await self._record_connection_failure(aid, exc)
@@ -1363,7 +1378,12 @@ class TgClientManager:
         for aid, cli in list(self._clients.items()):
             try:
                 ok = cli.is_connected()
-            except Exception:
+            except (OSError, RuntimeError) as exc:
+                log.debug(
+                    "account=%s connection-state read failed error=%s",
+                    aid,
+                    type(exc).__name__,
+                )
                 ok = False
             if ok:
                 connected_ids.append(aid)
@@ -1402,8 +1422,13 @@ class TgClientManager:
                 await self.stop_client(aid)
                 self._last_auth_check[aid] = now
                 continue
-            except Exception:
-                # Transient RPC failure — simply try again on a later slice.
+            except (RPCError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
+                # Transient Telegram/network failure — try again on a later slice.
+                log.debug(
+                    "account=%s authorization verify deferred error=%s",
+                    aid,
+                    type(exc).__name__,
+                )
                 continue
 
             self._last_auth_check[aid] = now
