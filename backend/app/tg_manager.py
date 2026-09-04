@@ -3,10 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import logging
-import os
-import re
 import secrets
-import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,13 +25,13 @@ from sqlalchemy.exc import IntegrityError
 
 from .config import settings
 from .account_scheduler import AccountActionScheduler
+from .session_files import SessionFileStore
 from .db import AsyncSessionLocal
 from .models import Account, AppSetting, SecurityMessage, GoneAccount
 from . import secrets_store
 from .tg_utils import (
     RECONNECT_BACKOFF_SECONDS,
     classify_777000,
-    normalize_phone as _normalize_phone,
     permanent_connection_status,
     redact_login_code,
 )
@@ -91,6 +88,7 @@ class TgClientManager:
         # Lifecycle locks above still protect client creation/removal, while the
         # scheduler serializes mutations per account and handles FloodWait/pacing.
         self._action_scheduler = AccountActionScheduler(log)
+        self._session_files = SessionFileStore(log)
         self.auto_reconnect = True
         self._reconnect_attempts: dict[int, int] = {}
         self._reconnect_at: dict[int, float] = {}
@@ -141,156 +139,70 @@ class TgClientManager:
         """Allow actions after startup (mainly useful for lifespan/tests)."""
         self._action_scheduler.resume()
 
-    # ---------- helpers ----------
+    # ---------- session-file compatibility wrappers ----------
     @staticmethod
     def normalize_phone(phone: str) -> str:
-        return _normalize_phone(phone)
+        return SessionFileStore.normalize_phone(phone)
 
     def _session_path(self, phone: str) -> str:
-        safe = self.normalize_phone(phone)[1:]
-        return str(settings.sessions_path / f"acc_{safe}")
+        return self._session_files.session_path(phone)
 
     def _phone_temp_session_path(self, phone: str) -> str:
-        digits = self.normalize_phone(phone)[1:]
-        return str(settings.sessions_path / f"login_{digits}_{secrets.token_urlsafe(8)}")
+        return self._session_files.phone_temp_session_path(phone)
 
     @staticmethod
     def _phone_file_part(phone: str) -> str:
-        digits = re.sub(r"\D", "", phone or "")
-        return digits or "unknown"
+        return SessionFileStore.phone_file_part(phone)
 
     @staticmethod
     def _username_file_part(username: str | None, user_id: int | None = None) -> str:
-        user = re.sub(r"[^A-Za-z0-9_]", "", (username or "").strip().lstrip("@"))
-        if user:
-            return user[:64]
-        if user_id:
-            return f"user{user_id}"
-        return "no_username"
+        return SessionFileStore.username_file_part(username, user_id)
 
-    def session_file_name(self, phone: str, username: str | None = None, user_id: int | None = None) -> str:
-        return f"{self._username_file_part(username, user_id)}_{self._phone_file_part(phone)}"
+    def session_file_name(
+        self,
+        phone: str,
+        username: str | None = None,
+        user_id: int | None = None,
+    ) -> str:
+        return self._session_files.session_file_name(phone, username, user_id)
 
-    def _desired_session_path(self, phone: str, username: str | None = None, user_id: int | None = None) -> str:
-        return str(settings.sessions_path / self.session_file_name(phone, username, user_id))
+    def _desired_session_path(
+        self,
+        phone: str,
+        username: str | None = None,
+        user_id: int | None = None,
+    ) -> str:
+        return self._session_files.desired_session_path(phone, username, user_id)
 
     def _path_from_session_file(self, session_file: str) -> str:
-        p = Path(session_file or "")
-        if p.suffix == ".session":
-            p = p.with_suffix("")
-        if p.is_absolute():
-            return str(p)
-        return str(settings.sessions_path / p.name)
+        return self._session_files.path_from_session_file(session_file)
 
     def _session_path_candidates(self, acc: Account) -> list[str]:
-        candidates = []
-        if acc.session_file:
-            candidates.append(self._path_from_session_file(acc.session_file))
-        candidates.append(self._desired_session_path(acc.phone, acc.username, acc.tg_user_id))
-        candidates.append(self._path_from_session_file(f"acc_{acc.phone}"))
-        candidates.append(self._session_path(acc.phone))
-
-        unique = []
-        seen = set()
-        for c in candidates:
-            if c and c not in seen:
-                unique.append(c)
-                seen.add(c)
-        return unique
+        return self._session_files.session_path_candidates(acc)
 
     def _session_path_for_account(self, acc: Account) -> str:
-        candidates = self._session_path_candidates(acc)
-        for c in candidates:
-            if Path(c + ".session").exists():
-                return c
-        return candidates[0]
+        return self._session_files.session_path_for_account(acc)
 
     def _move_session_files(self, src_base: str, dst_base: str):
-        src = Path(src_base)
-        dst = Path(dst_base)
-        if src.resolve() == dst.resolve():
-            return
-
-        suffixes = [".session", ".session-journal", ".session-wal", ".session-shm"]
-        if not any(Path(str(src) + suffix).exists() for suffix in suffixes):
-            return
-
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        for suffix in suffixes:
-            self._safe_unlink(str(dst) + suffix)
-        for suffix in suffixes:
-            s = Path(str(src) + suffix)
-            if not s.exists():
-                continue
-            d = Path(str(dst) + suffix)
-            shutil.move(str(s), str(d))
+        self._session_files.move_session_files(src_base, dst_base)
 
     def begin_session_swap(self, src_base: str, dst_base: str) -> dict:
-        """Install a verified, disconnected session with an atomic replace.
-
-        Existing destination files are renamed to unique rollback files first.
-        The returned token must be committed or rolled back by the caller after
-        its database transaction and client startup complete.
-        """
-        src = Path(src_base)
-        dst = Path(dst_base)
-        src_main = Path(str(src) + ".session")
-        if not src_main.is_file():
-            raise RuntimeError("Verified session file is missing")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        suffixes = [".session", ".session-journal", ".session-wal", ".session-shm"]
-        token = secrets.token_hex(8)
-        state = {
-            "src": str(src), "dst": str(dst), "moved": [], "backups": []
-        }
-        try:
-            for suffix in suffixes:
-                target = Path(str(dst) + suffix)
-                if target.exists():
-                    backup = Path(str(target) + f".rollback-{token}")
-                    os.replace(target, backup)
-                    state["backups"].append((str(target), str(backup)))
-            for suffix in suffixes:
-                source = Path(str(src) + suffix)
-                if source.exists():
-                    target = Path(str(dst) + suffix)
-                    os.replace(source, target)
-                    state["moved"].append((str(source), str(target)))
-            if not Path(str(dst) + ".session").is_file():
-                raise RuntimeError("Session replace did not produce a destination file")
-            return state
-        except BaseException:
-            self.rollback_session_swap(state)
-            raise
+        return self._session_files.begin_session_swap(src_base, dst_base)
 
     def rollback_session_swap(self, state: dict):
-        for source, target in reversed(state.get("moved", [])):
-            target_path = Path(target)
-            if target_path.exists():
-                Path(source).parent.mkdir(parents=True, exist_ok=True)
-                os.replace(target_path, source)
-        for target, backup in reversed(state.get("backups", [])):
-            backup_path = Path(backup)
-            if backup_path.exists():
-                os.replace(backup_path, target)
+        self._session_files.rollback_session_swap(state)
 
     def commit_session_swap(self, state: dict, old_bases: list[str] | None = None):
-        for _target, backup in state.get("backups", []):
-            self._safe_unlink(backup)
-        destination = str(Path(state["dst"]).resolve()).lower()
-        for base in old_bases or []:
-            if base and str(Path(base).resolve()).lower() != destination:
-                self._remove_session_files(base)
+        self._session_files.commit_session_swap(state, old_bases)
 
     def _remove_session_files(self, base: str):
-        if not base:
-            return
-        for suffix in [".session", ".session-journal", ".session-wal", ".session-shm"]:
-            self._safe_unlink(base + suffix)
+        self._session_files.remove_session_files(base)
 
     async def promote_phone_session(self, phone: str, me: TgUser) -> str:
-        dst = self._desired_session_path(phone, getattr(me, "username", None), getattr(me, "id", None))
-        self._move_session_files(self._session_path(phone), dst)
+        dst = self._desired_session_path(
+            phone, getattr(me, "username", None), getattr(me, "id", None)
+        )
+        self._session_files.move_session_files(self._session_path(phone), dst)
         return Path(dst).name
 
     async def inspect_imported_session(self, session_base: str) -> tuple[TgUser, str]:
@@ -327,8 +239,10 @@ class TgClientManager:
                 pass
 
     async def promote_imported_session(self, session_base: str, phone: str, me: TgUser) -> str:
-        dst = self._desired_session_path(phone, getattr(me, "username", None), getattr(me, "id", None))
-        self._move_session_files(session_base, dst)
+        dst = self._desired_session_path(
+            phone, getattr(me, "username", None), getattr(me, "id", None)
+        )
+        self._session_files.move_session_files(session_base, dst)
         if not Path(dst + ".session").exists():
             raise RuntimeError("Imported session file could not be saved")
         return Path(dst).name
@@ -339,10 +253,7 @@ class TgClientManager:
 
     @staticmethod
     def _is_importable_session_file(path: Path) -> bool:
-        if path.suffix.lower() != ".session":
-            return False
-        stem = path.stem.lower()
-        return not (stem.startswith("qr_") or stem.startswith("mtm_import_"))
+        return SessionFileStore.is_importable_session_file(path)
 
     async def sync_session_folder(self, force: bool = False) -> dict:
         """Discover authorized .session files pasted into the sessions folder.
@@ -1164,14 +1075,8 @@ class TgClientManager:
     async def qr_cancel(self, qr_id: str):
         await self._close_qr_entry(qr_id, remove=True)
 
-    @staticmethod
-    def _safe_unlink(path: str):
-        try:
-            p = Path(path)
-            if p.exists():
-                p.unlink()
-        except OSError as exc:
-            log.debug("could not remove session artifact path=%s error=%s", path, type(exc).__name__)
+    def _safe_unlink(self, path: str):
+        self._session_files.safe_unlink(path)
 
     # ---------- listener ----------
     def _attach_listener(self, account_id: int, cli: TelegramClient):
