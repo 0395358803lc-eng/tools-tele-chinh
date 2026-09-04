@@ -366,7 +366,7 @@ class TgClientManager:
                 for base in self._session_path_candidates(acc):
                     try:
                         known_paths.add(str(Path(base + ".session").resolve()).lower())
-                    except Exception:
+                    except (OSError, RuntimeError):
                         pass
 
             success = failed = skipped = 0
@@ -725,14 +725,20 @@ class TgClientManager:
             self._attach_listener(acc.id, cli)
             self._reset_reconnect(acc.id)
             await self._set_status(acc.id, "connected")
-            # sync profile
+            # Sync profile best-effort for Telegram/network failures. Database or
+            # programming errors are intentionally not swallowed.
             try:
                 me = await asyncio.wait_for(
                     cli.get_me(), timeout=float(settings.TELEGRAM_AUTH_TIMEOUT)
                 )
+            except (RPCError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
+                log.warning(
+                    "account=%s profile refresh skipped error=%s",
+                    acc.id,
+                    type(exc).__name__,
+                )
+            else:
                 await self._sync_profile(acc.id, me)
-            except Exception:
-                pass
             # backfill recent 777000 messages we may have missed while offline
             try:
                 await asyncio.wait_for(
@@ -887,17 +893,19 @@ class TgClientManager:
         if not pend:
             raise RuntimeError("No pending 2FA session. Send code first.")
         cli: TelegramClient = pend['client']
-        try:
-            await asyncio.wait_for(cli.sign_in(password=password), timeout=30)
-        except Exception:
-            # wrong password OR network: keep pending so user can retry
-            raise
+        # Keep the pending session on authentication/network failure so the user
+        # can retry; there is no cleanup here, so no catch-and-reraise is needed.
+        await asyncio.wait_for(cli.sign_in(password=password), timeout=30)
         me = await cli.get_me()
         # Remember this 2FA password locally so bulk ops can reuse it.
         try:
             await secrets_store.save_2fa(phone, password)
-        except Exception:
-            pass
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.warning(
+                "phone=%s secure 2FA password save failed error=%s",
+                self._phone_file_part(phone)[-4:],
+                type(exc).__name__,
+            )
         pend['authorized'] = True
         pend['me'] = me
         with suppress(Exception, asyncio.CancelledError):
@@ -1107,8 +1115,11 @@ class TgClientManager:
         try:
             if getattr(me, "phone", None):
                 await secrets_store.save_2fa(me.phone, password)
-        except Exception:
-            pass
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.warning(
+                "qr secure 2FA password save failed error=%s",
+                type(exc).__name__,
+            )
         return me
 
     async def qr_promote_to_phone(self, qr_id: str, phone: str):
@@ -1159,8 +1170,8 @@ class TgClientManager:
             p = Path(path)
             if p.exists():
                 p.unlink()
-        except Exception:
-            pass
+        except OSError as exc:
+            log.debug("could not remove session artifact path=%s error=%s", path, type(exc).__name__)
 
     # ---------- listener ----------
     def _attach_listener(self, account_id: int, cli: TelegramClient):
@@ -1248,15 +1259,20 @@ class TgClientManager:
             acc.last_name = me.last_name or ""
             acc.username = me.username or ""
             acc.tg_user_id = me.id
-            # 2FA detection
+            # 2FA detection is best-effort for Telegram/network failures. Keep DB
+            # failures visible instead of silently turning them into stale profile data.
             try:
                 cli = self._clients.get(account_id)
                 if cli:
                     from telethon.tl.functions.account import GetPasswordRequest
                     pw = await cli(GetPasswordRequest())
                     acc.has_2fa = bool(pw.has_password)
-            except Exception:
-                pass
+            except (RPCError, ConnectionError, OSError) as exc:
+                log.debug(
+                    "account=%s 2FA status refresh skipped error=%s",
+                    account_id,
+                    type(exc).__name__,
+                )
             await db.commit()
 
     async def _backfill_777000(self, account_id: int, cli: TelegramClient, limit: int = 50):
