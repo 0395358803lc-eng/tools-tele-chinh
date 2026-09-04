@@ -153,8 +153,15 @@ def migrate_legacy_runtime_data():
                 finally:
                     destination_db.close()
                     source_db.close()
-        for name in ("twofa.bin", "twofa.json"):
-            source = legacy_sessions / name
-            destination = settings.secrets_path / name
-            if source.exists() and not destination.exists():
-                shutil.copy2(source, destination)
+        # Encrypted stores are safe to copy. Legacy plaintext must be MOVED
+        # when possible so migration never creates a second plaintext copy.
+        encrypted_source = legacy_sessions / "twofa.bin"
+        encrypted_destination = settings.secrets_path / "twofa.bin"
+        if encrypted_source.exists() and not encrypted_destination.exists():
+            shutil.copy2(encrypted_source, encrypted_destination)
+
+        plaintext_source = legacy_sessions / "twofa.json"
+        plaintext_destination = settings.secrets_path / "twofa.json"
+        if plaintext_source.exists() and not plaintext_destination.exists():
+            shutil.move(str(plaintext_source), str(plaintext_destination))
+            log.info("moved legacy plaintext 2FA store into secure migration staging")
