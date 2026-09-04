@@ -4,7 +4,6 @@ import asyncio
 from contextlib import suppress
 import logging
 import os
-import random
 import re
 import secrets
 import shutil
@@ -16,7 +15,6 @@ from typing import Awaitable, Callable, Optional, TypeVar
 from telethon import TelegramClient, events
 from telethon.errors import (
     AuthKeyUnregisteredError,
-    FloodWaitError,
     UserDeactivatedBanError,
     UserDeactivatedError,
     SessionPasswordNeededError,
@@ -29,6 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from .config import settings
+from .account_scheduler import AccountActionScheduler
 from .db import AsyncSessionLocal
 from .models import Account, AppSetting, SecurityMessage, GoneAccount
 from . import secrets_store
@@ -88,16 +87,10 @@ class TgClientManager:
         # global lock would serialize all 100+ accounts on boot).
         self._locks: dict[int, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
-        # Telegram state-changing calls use a separate per-account scheduler.
-        # Lifecycle locks above protect client creation/removal; action locks
-        # below guarantee that one account never performs two mutations at once.
-        self._action_locks: dict[int, asyncio.Lock] = {}
-        self._cooldown_until: dict[int, float] = {}
-        self._next_allowed_at: dict[int, float] = {}
-        self._accepting_actions = True
-        self._active_actions = 0
-        self._actions_idle = asyncio.Event()
-        self._actions_idle.set()
+        # Telegram state-changing calls are delegated to a focused scheduler.
+        # Lifecycle locks above still protect client creation/removal, while the
+        # scheduler serializes mutations per account and handles FloodWait/pacing.
+        self._action_scheduler = AccountActionScheduler(log)
         self.auto_reconnect = True
         self._reconnect_attempts: dict[int, int] = {}
         self._reconnect_at: dict[int, float] = {}
@@ -123,43 +116,17 @@ class TgClientManager:
             return lk
 
     def get_action_lock(self, account_id: int) -> asyncio.Lock:
-        """Return the mutation lock for an account.
-
-        This method intentionally has no await: all accesses happen on the
-        application's single asyncio event loop, so creating with setdefault
-        cannot race with another Python task between bytecode instructions.
-        """
-        lock = self._action_locks.get(account_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._action_locks[account_id] = lock
-        return lock
+        """Compatibility wrapper for lifecycle code that shares mutation locks."""
+        return self._action_scheduler.action_lock(account_id)
 
     async def wait_for_account_cooldown(self, account_id: int):
-        """Wait for both Telegram FloodWait and normal per-account pacing."""
-        until = max(
-            self._cooldown_until.get(account_id, 0.0),
-            self._next_allowed_at.get(account_id, 0.0),
-        )
-        delay = until - time.monotonic()
-        if delay > 0:
-            await asyncio.sleep(delay)
+        await self._action_scheduler.wait_for_cooldown(account_id)
 
     def note_flood_wait(self, account_id: int, seconds: int | float):
-        """Apply a FloodWait to every subsequent mutation for this account."""
-        seconds = max(0.0, float(seconds))
-        until = time.monotonic() + seconds
-        self._cooldown_until[account_id] = max(
-            self._cooldown_until.get(account_id, 0.0), until
-        )
-        log.warning(
-            "account=%s operation=telegram_mutation error_code=FLOOD_WAIT seconds=%s",
-            account_id,
-            int(seconds),
-        )
+        self._action_scheduler.note_flood_wait(account_id, seconds)
 
     def cooldown_remaining(self, account_id: int) -> float:
-        return max(0.0, self._cooldown_until.get(account_id, 0.0) - time.monotonic())
+        return self._action_scheduler.cooldown_remaining(account_id)
 
     async def run_account_action(
         self,
@@ -167,68 +134,12 @@ class TgClientManager:
         action: Callable[[], Awaitable[T]],
         operation: str = "telegram_mutation",
     ) -> T:
-        """Serialize, cool down and pace one Telegram mutation.
-
-        Different account IDs have independent locks and therefore still run in
-        parallel. FloodWait is recorded before it is re-raised to the router.
-        """
-        if not self._accepting_actions:
-            raise RuntimeError("Application is shutting down")
-
-        self._active_actions += 1
-        self._actions_idle.clear()
-        started = time.monotonic()
-        invoked = False
-        try:
-            async with self.get_action_lock(account_id):
-                await self.wait_for_account_cooldown(account_id)
-                invoked = True
-                try:
-                    result = await action()
-                except FloodWaitError as exc:
-                    self.note_flood_wait(account_id, exc.seconds)
-                    raise
-                finally:
-                    if invoked:
-                        lo = max(0.0, float(getattr(settings, "RATE_MIN", 0.0)))
-                        hi = max(lo, float(getattr(settings, "RATE_MAX", lo)))
-                        self._next_allowed_at[account_id] = (
-                            time.monotonic() + random.uniform(lo, hi)
-                        )
-                duration_ms = int((time.monotonic() - started) * 1000)
-                log.info(
-                    "account=%s operation=%s status=success duration_ms=%s",
-                    account_id,
-                    operation,
-                    duration_ms,
-                )
-                return result
-        except FloodWaitError:
-            duration_ms = int((time.monotonic() - started) * 1000)
-            log.warning(
-                "account=%s operation=%s status=rate_limited duration_ms=%s",
-                account_id,
-                operation,
-                duration_ms,
-            )
-            raise
-        except Exception:
-            duration_ms = int((time.monotonic() - started) * 1000)
-            log.exception(
-                "account=%s operation=%s status=failed duration_ms=%s",
-                account_id,
-                operation,
-                duration_ms,
-            )
-            raise
-        finally:
-            self._active_actions -= 1
-            if self._active_actions == 0:
-                self._actions_idle.set()
+        """Run one Telegram mutation through the per-account scheduler."""
+        return await self._action_scheduler.run(account_id, action, operation)
 
     def resume_actions(self):
         """Allow actions after startup (mainly useful for lifespan/tests)."""
-        self._accepting_actions = True
+        self._action_scheduler.resume()
 
     # ---------- helpers ----------
     @staticmethod
@@ -672,19 +583,17 @@ class TgClientManager:
         sync_task.add_done_callback(self._background_tasks.discard)
 
     async def shutdown(self, action_timeout: float = 30.0):
-        self._accepting_actions = False
+        self._action_scheduler.stop_accepting()
         background = list(self._background_tasks)
         for task in background:
             task.cancel()
         if background:
             await asyncio.gather(*background, return_exceptions=True)
         self._background_tasks.clear()
-        try:
-            await asyncio.wait_for(self._actions_idle.wait(), timeout=action_timeout)
-        except asyncio.TimeoutError:
+        if not await self._action_scheduler.wait_idle(action_timeout):
             log.warning(
                 "graceful shutdown timed out with %s Telegram action(s) pending",
-                self._active_actions,
+                self._action_scheduler.active_actions,
             )
         for cli in list(self._clients.values()):
             try:
