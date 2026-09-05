@@ -8,7 +8,7 @@ def utc_now_naive() -> datetime:
     """Return current UTC time as a naive datetime for existing SQLite columns.
 
     The project intentionally stores naive UTC datetimes today. Using
-    datetime.now(timezone.utc) avoids datetime.utcnow() deprecation while
+    datetime.now(timezone.utc) avoids the deprecated naive-UTC constructor while
     preserving the current database representation and avoiding a schema
     migration.
     """
