@@ -193,8 +193,7 @@ async def _terminate_other_authorizations(cli) -> tuple[int, int]:
         except RPCError as exc:
             failed += 1
             log.warning(
-                "session termination rejected authorization_hash=%s error_type=%s",
-                a.hash,
+                "session termination rejected error_type=%s",
                 type(exc).__name__,
             )
     return killed, failed
