@@ -9,6 +9,7 @@ import socket
 import sys
 import tempfile
 import threading
+import traceback
 import time
 import urllib.request
 from pathlib import Path
@@ -247,6 +248,13 @@ def _smoke_test(runtime_root: Path, env_path: Path) -> int:
                     code = 3
     except Exception:
         code = 6
+        try:
+            (runtime_root / "desktop-smoke-error.txt").write_text(
+                traceback.format_exc(),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
     finally:
         if server is not None:
             _stop_server(server, thread, app)
