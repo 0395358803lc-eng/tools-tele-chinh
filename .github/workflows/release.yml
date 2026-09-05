@@ -52,6 +52,65 @@ jobs:
           "path=$($zip.FullName)" >> $env:GITHUB_OUTPUT
           "name=$($zip.Name)" >> $env:GITHUB_OUTPUT
 
+      - name: Expand and validate packaged release
+        id: packaged
+        shell: pwsh
+        run: |
+          $extract = Join-Path $env:RUNNER_TEMP "mtm-release-acceptance"
+          if (Test-Path -LiteralPath $extract) {
+            Remove-Item -LiteralPath $extract -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $extract | Out-Null
+          Expand-Archive -LiteralPath "${{ steps.archive.outputs.path }}" -DestinationPath $extract
+
+          $root = Get-ChildItem -LiteralPath $extract -Directory | Select-Object -First 1
+          if (-not $root) { throw "Release archive has no top-level directory" }
+
+          $backend = Join-Path $root.FullName "backend"
+          if (-not (Test-Path -LiteralPath (Join-Path $backend "run_server.py"))) {
+            throw "Packaged release is missing backend/run_server.py"
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $backend "static/index.html"))) {
+            throw "Packaged release is missing backend/static/index.html"
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $root.FullName "START.bat"))) {
+            throw "Packaged release is missing START.bat"
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $root.FullName "STOP.bat"))) {
+            throw "Packaged release is missing STOP.bat"
+          }
+
+          $unsafe = Get-ChildItem -LiteralPath $root.FullName -Recurse -Force | Where-Object {
+            $_.Name -in @('.env', 'app.db', 'twofa.bin', 'node_modules', '.venv', '.git') -or
+            $_.Name -like '*.session' -or
+            $_.Name -like '*.session-wal' -or
+            $_.Name -like '*.session-shm' -or
+            $_.Name -like '*.session-journal'
+          }
+          if ($unsafe) {
+            $names = ($unsafe | ForEach-Object FullName) -join [Environment]::NewLine
+            throw "Unsafe packaged release contents detected:`n$names"
+          }
+
+          "root=$($root.FullName)" >> $env:GITHUB_OUTPUT
+          "backend=$backend" >> $env:GITHUB_OUTPUT
+
+      - name: Smoke packaged release
+        shell: pwsh
+        run: |
+          $backend = "${{ steps.packaged.outputs.backend }}"
+          $root = "${{ steps.packaged.outputs.root }}"
+          try {
+            .\backend\.venv\Scripts\python.exe .\backend\tests\runtime_smoke.py --backend-root "$backend"
+            if ($LASTEXITCODE -ne 0) { throw "Packaged release runtime smoke failed" }
+          } finally {
+            $log = Join-Path $root "runtime-smoke-uvicorn.log"
+            if (Test-Path -LiteralPath $log) {
+              Write-Host "===== packaged runtime log ====="
+              Get-Content -LiteralPath $log
+            }
+          }
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
