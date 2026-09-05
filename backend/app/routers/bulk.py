@@ -12,7 +12,14 @@ from ..models import Account
 from ..schemas import BulkProfileIn
 from ..tg_manager import manager
 from ..utils import bulk_stream, ok_result, skipped_result
-from ..uploads import ensure_image_upload, read_limited, sanitize_filename, validate_image_bytes, IMAGE_MAX_BYTES
+from ..uploads import (
+    IMAGE_MAX_BYTES,
+    cleanup_temp_files,
+    ensure_image_upload,
+    read_limited,
+    sanitize_filename,
+    validate_image_bytes,
+)
 
 router = APIRouter(prefix="/api/bulk", tags=["bulk"])
 
@@ -139,10 +146,9 @@ async def bulk_photo(
             suffix = os.path.splitext(sanitize_filename(f.filename))[1] or ".jpg"
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp.write(data); tmp_paths.append(tmp.name)
-    except Exception:
-        for p in tmp_paths:
-            try: os.unlink(p)
-            except Exception: pass
+    except BaseException:
+        # Includes cancellation: staged files must not survive an aborted request.
+        cleanup_temp_files(tmp_paths)
         raise
 
     path_by_id: dict[int, str | None] = {}
@@ -167,8 +173,6 @@ async def bulk_photo(
             async for line in bulk_stream(accounts, _do):
                 yield line
         finally:
-            for p in tmp_paths:
-                try: os.unlink(p)
-                except Exception: pass
+            cleanup_temp_files(tmp_paths)
 
     return StreamingResponse(_gen(), media_type="application/x-ndjson")
