@@ -73,13 +73,17 @@ jobs:
           } catch {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
             $log = Join-Path $runtime "data\logs\app.log"
+            $diag = Join-Path $runtime "desktop-smoke-error.txt"
             if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }
+            if (Test-Path -LiteralPath $diag) { Get-Content -LiteralPath $diag }
             throw "Portable desktop smoke timed out after 120 seconds"
           }
           $process.Refresh()
           if ($process.ExitCode -ne 0) {
             $log = Join-Path $runtime "data\logs\app.log"
+            $diag = Join-Path $runtime "desktop-smoke-error.txt"
             if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }
+            if (Test-Path -LiteralPath $diag) { Get-Content -LiteralPath $diag }
             throw "Portable desktop smoke failed with exit code $($process.ExitCode)"
           }
 
