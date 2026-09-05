@@ -164,10 +164,15 @@ def main(backend_root: Path | None = None) -> int:
             payload = json.loads(exc.read().decode("utf-8"))
             assert payload.get("detail") == "Not Found", payload
 
-        # Exercise the real PID-bound graceful shutdown proof.
+        # Exercise the real PID-bound graceful shutdown proof. STOP.bat binds
+        # its HMAC to the PID that actually owns the listening socket; on Windows
+        # a launcher/venv process can differ from that server PID, so mirror the
+        # production semantics using the authenticated diagnostics value.
+        server_pid = int(diagnostics["pid"])
+        assert server_pid > 0, diagnostics
         token = hmac.new(
             SESSION_SECRET.encode("utf-8"),
-            str(proc.pid).encode("ascii"),
+            str(server_pid).encode("ascii"),
             hashlib.sha256,
         ).hexdigest()
         with _request(
@@ -196,6 +201,8 @@ def main(backend_root: Path | None = None) -> int:
                         "secret_store": diagnostics["secret_store"],
                         "accounts": diagnostics["accounts"],
                     },
+                    "process_pid": proc.pid,
+                    "server_pid": server_pid,
                     "graceful_shutdown": True,
                 },
                 ensure_ascii=False,
