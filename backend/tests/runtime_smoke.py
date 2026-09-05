@@ -8,6 +8,7 @@ accounts.
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import hmac
 import http.cookiejar
@@ -20,10 +21,7 @@ import time
 import urllib.error
 import urllib.request
 
-BACKEND_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = BACKEND_ROOT.parent
-ENV_PATH = BACKEND_ROOT / ".env"
-STATIC_INDEX = BACKEND_ROOT / "static" / "index.html"
+SOURCE_BACKEND_ROOT = Path(__file__).resolve().parents[1]
 BASE = "http://127.0.0.1:8000"
 PASSWORD = "runtime-smoke-password"
 SESSION_SECRET = "runtime-smoke-session-secret-" + ("s" * 48)
@@ -61,8 +59,8 @@ def _wait_for_health(opener, proc: subprocess.Popen, timeout=35):
     raise RuntimeError(f"backend health timeout: {type(last_error).__name__ if last_error else 'unknown'}")
 
 
-def _write_smoke_env():
-    ENV_PATH.write_text(
+def _write_smoke_env(env_path: Path):
+    env_path.write_text(
         "\n".join(
             [
                 "TG_API_ID=12345",
@@ -80,25 +78,32 @@ def _write_smoke_env():
     )
 
 
-def main() -> int:
+def main(backend_root: Path | None = None) -> int:
+    backend_root = (backend_root or SOURCE_BACKEND_ROOT).resolve()
+    project_root = backend_root.parent
+    env_path = backend_root / ".env"
+    static_index = backend_root / "static" / "index.html"
+
     if os.name != "nt":
         raise RuntimeError("runtime_smoke.py must run on Windows because secure storage requires DPAPI")
-    if not STATIC_INDEX.is_file():
-        raise RuntimeError("backend/static/index.html is missing; restore the frontend artifact first")
-    if ENV_PATH.exists():
-        raise RuntimeError("backend/.env unexpectedly exists in the clean CI checkout")
+    if not (backend_root / "run_server.py").is_file():
+        raise RuntimeError(f"run_server.py is missing from backend root: {backend_root}")
+    if not static_index.is_file():
+        raise RuntimeError(f"backend/static/index.html is missing under: {backend_root}")
+    if env_path.exists():
+        raise RuntimeError(f"backend/.env unexpectedly exists before smoke: {env_path}")
 
     cookie_jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
     proc = None
-    log_path = PROJECT_ROOT / "runtime-smoke-uvicorn.log"
+    log_path = project_root / "runtime-smoke-uvicorn.log"
 
     try:
-        _write_smoke_env()
+        _write_smoke_env(env_path)
         with log_path.open("w", encoding="utf-8") as log_handle:
             proc = subprocess.Popen(
                 [sys.executable, "run_server.py"],
-                cwd=BACKEND_ROOT,
+                cwd=backend_root,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -159,10 +164,15 @@ def main() -> int:
             payload = json.loads(exc.read().decode("utf-8"))
             assert payload.get("detail") == "Not Found", payload
 
-        # Exercise the real PID-bound graceful shutdown proof.
+        # Exercise the real PID-bound graceful shutdown proof. STOP.bat binds
+        # its HMAC to the PID that actually owns the listening socket; on Windows
+        # a launcher/venv process can differ from that server PID, so mirror the
+        # production semantics using the authenticated diagnostics value.
+        server_pid = int(diagnostics["pid"])
+        assert server_pid > 0, diagnostics
         token = hmac.new(
             SESSION_SECRET.encode("utf-8"),
-            str(proc.pid).encode("ascii"),
+            str(server_pid).encode("ascii"),
             hashlib.sha256,
         ).hexdigest()
         with _request(
@@ -191,6 +201,8 @@ def main() -> int:
                         "secret_store": diagnostics["secret_store"],
                         "accounts": diagnostics["accounts"],
                     },
+                    "process_pid": proc.pid,
+                    "server_pid": server_pid,
                     "graceful_shutdown": True,
                 },
                 ensure_ascii=False,
@@ -204,7 +216,7 @@ def main() -> int:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
-        ENV_PATH.unlink(missing_ok=True)
+        env_path.unlink(missing_ok=True)
         if log_path.exists():
             # Keep the log on failure for Actions upload/debug; successful CI can
             # also print it if needed without contaminating runtime data.
@@ -212,4 +224,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--backend-root",
+        type=Path,
+        default=SOURCE_BACKEND_ROOT,
+        help="Backend directory to smoke-test; defaults to the current source checkout.",
+    )
+    args = parser.parse_args()
+    raise SystemExit(main(args.backend_root))

@@ -1,17 +1,16 @@
-name: Build Release
+name: Release Acceptance
 
 on:
-  push:
-    tags:
-      - "v*"
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  windows-release:
-    name: Build sanitized Windows release
+  packaged-windows-release:
+    name: Build and boot packaged Windows ZIP
     runs-on: windows-latest
 
     steps:
@@ -39,7 +38,7 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Build and validate release
+      - name: Build sanitized release
         shell: pwsh
         run: .\build_release.ps1
 
@@ -52,21 +51,14 @@ jobs:
           "path=$($zip.FullName)" >> $env:GITHUB_OUTPUT
           "name=$($zip.Name)" >> $env:GITHUB_OUTPUT
 
-      - name: Validate packaged release
+      - name: Validate and boot packaged release
         shell: pwsh
         run: |
           .\validate_release.ps1 -ZipPath "${{ steps.archive.outputs.path }}" -PythonPath ".\backend\.venv\Scripts\python.exe"
 
-      - name: Upload workflow artifact
+      - name: Upload accepted release
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.archive.outputs.name }}
+          name: accepted-${{ steps.archive.outputs.name }}
           path: ${{ steps.archive.outputs.path }}
           if-no-files-found: error
-
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ steps.archive.outputs.path }}
-          generate_release_notes: true
