@@ -124,7 +124,13 @@ class ClientStartServiceTests(unittest.IsolatedAsyncioTestCase):
 class ClientStartManagerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_manager_legacy_telegram_client_patch_path_still_controls_factory(self):
         manager = TgClientManager()
-        acc = SimpleNamespace(id=15)
+        acc = SimpleNamespace(
+            id=15,
+            phone="+84111111111",
+            username="demo",
+            tg_user_id=15,
+            session_file="demo_84111111111",
+        )
         client = SimpleNamespace(
             is_connected=lambda: False,
             connect=AsyncMock(),
