@@ -234,20 +234,26 @@ def _smoke_test(runtime_root: Path, env_path: Path) -> int:
         secrets.token_urlsafe(64),
     )
     server = thread = app = None
+    code = 0
     try:
         server, thread, app = _start_server()
         health = _wait_ready()
         if health.get("database") != "ok" or health.get("secret_store") != "ok":
-            return 2
-        with urllib.request.urlopen(f"{URL}/", timeout=5) as response:
-            html = response.read().decode("utf-8", errors="replace")
-            if response.status != 200 or "<html" not in html.lower():
-                return 3
-        return 0
+            code = 2
+        else:
+            with urllib.request.urlopen(f"{URL}/", timeout=5) as response:
+                html = response.read().decode("utf-8", errors="replace")
+                if response.status != 200 or "<html" not in html.lower():
+                    code = 3
+    except Exception:
+        code = 6
     finally:
         if server is not None:
             _stop_server(server, thread, app)
+
+    if code == 0:
         shutil.rmtree(runtime_root, ignore_errors=True)
+    return code
 
 
 def _show_error(message: str, runtime_root: Path):
@@ -269,7 +275,13 @@ def main() -> int:
     _backend_root, runtime_root, env_path = _configure_paths()
     smoke = "--smoke-test" in sys.argv
     if smoke:
-        return _smoke_test(runtime_root, env_path)
+        code = _smoke_test(runtime_root, env_path)
+        # PyInstaller/GUI support libraries can leave non-daemon helper threads
+        # behind even though the backend already shut down. CI smoke must have
+        # deterministic process lifetime.
+        if getattr(sys, "frozen", False):
+            os._exit(code)
+        return code
 
     if _port_in_use():
         _show_error(
