@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from sqlalchemy.exc import IntegrityError
 
-from app import tg_manager
+from app import security_messages, tg_manager
 
 
 class _ExpectedRpcError(Exception):
@@ -84,8 +84,8 @@ class SecurityBackfillBoundaryTests(unittest.IsolatedAsyncioTestCase):
         client = _Client(_AsyncIterator(terminal_error=_ExpectedRpcError("sensitive-marker")))
 
         with (
-            patch.object(tg_manager, "RPCError", _ExpectedRpcError),
-            patch.object(tg_manager, "AsyncSessionLocal", _SessionFactory(initial_db)),
+            patch.object(security_messages, "RPCError", _ExpectedRpcError),
+            patch.object(security_messages, "AsyncSessionLocal", _SessionFactory(initial_db)),
             self.assertLogs("tg_manager", level="WARNING") as captured,
         ):
             await tg_manager.manager._backfill_777000(7, client, limit=10)
@@ -100,7 +100,7 @@ class SecurityBackfillBoundaryTests(unittest.IsolatedAsyncioTestCase):
         client = _Client(_AsyncIterator(terminal_error=RuntimeError("programming bug")))
 
         with patch.object(
-            tg_manager,
+            security_messages,
             "AsyncSessionLocal",
             _SessionFactory(initial_db),
         ):
@@ -113,7 +113,7 @@ class SecurityBackfillBoundaryTests(unittest.IsolatedAsyncioTestCase):
         client = _Client(_AsyncIterator([_message()]))
 
         with patch.object(
-            tg_manager,
+            security_messages,
             "AsyncSessionLocal",
             _SessionFactory(initial_db, write_db),
         ):
@@ -129,7 +129,7 @@ class SecurityBackfillBoundaryTests(unittest.IsolatedAsyncioTestCase):
         client = _Client(_AsyncIterator([_message()]))
 
         with patch.object(
-            tg_manager,
+            security_messages,
             "AsyncSessionLocal",
             _SessionFactory(initial_db, write_db),
         ):
@@ -140,7 +140,7 @@ class SecurityBackfillBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
 class SecurityBackfillSourceGuardTests(unittest.TestCase):
     def test_backfill_does_not_catch_broad_exception(self):
-        source_path = Path(__file__).resolve().parents[1] / "app" / "tg_manager.py"
+        source_path = Path(__file__).resolve().parents[1] / "app" / "security_messages.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
         offenders = []
         for node in ast.walk(tree):
