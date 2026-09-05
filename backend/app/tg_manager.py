@@ -32,6 +32,7 @@ from . import secrets_store
 from .time_utils import utc_now_naive
 from .tg_utils import (
     RECONNECT_BACKOFF_SECONDS,
+    classify_777000,  # compatibility re-export for existing callers/tests
     permanent_connection_status,
     redact_login_code,
 )
