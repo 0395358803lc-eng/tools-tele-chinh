@@ -56,6 +56,9 @@ async def run_migrations():
     from sqlalchemy import create_engine, inspect as sa_inspect
 
     config = Config(str(BACKEND_ROOT / "alembic.ini"))
+    # The desktop executable can run from any working directory, so never
+    # resolve Alembic scripts relative to cwd.
+    config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     root_rev = None
     for rev in script.walk_revisions():
