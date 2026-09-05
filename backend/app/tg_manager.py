@@ -26,6 +26,7 @@ from .account_scheduler import AccountActionScheduler
 from .client_cleanup import TelegramClientCleanup
 from .session_files import SessionFileStore
 from .session_folder_sync import SessionFolderSyncService
+from .phone_login import PhoneLoginService
 from .security_messages import SecurityMessageService, SERVICE_ID
 from .db import AsyncSessionLocal
 from .models import Account, AppSetting, GoneAccount
@@ -74,9 +75,7 @@ async def record_gone_account(db, acc: Account, reason: str):
 class TgClientManager:
     def __init__(self):
         self._clients: dict[int, TelegramClient] = {}  # account_id -> client
-        self._pending: dict[str, dict] = {}  # phone -> {'client', 'phone_code_hash', 'needs_2fa'}
         self._qr_pending: dict[str, dict] = {}  # qr_id -> {'client', 'qr_login', 'wait_task', 'needs_2fa', 'session_path'}
-        self._phone_locks: dict[str, asyncio.Lock] = {}
         self._qr_locks: dict[str, asyncio.Lock] = {}
         self._qr_completed: dict[str, tuple[float, dict]] = {}
         # Per-account locks so two calls can't start/stop the SAME account at
@@ -90,6 +89,14 @@ class TgClientManager:
         self._action_scheduler = AccountActionScheduler(log)
         self._cleanup = TelegramClientCleanup(log)
         self._session_files = SessionFileStore(log)
+        self._phone_login = PhoneLoginService(
+            normalize_phone=self.normalize_phone,
+            temp_session_path=self._phone_temp_session_path,
+            safe_disconnect=self._safe_disconnect,
+            remove_session_files=self._remove_session_files,
+            phone_file_part=self._phone_file_part,
+            logger=log,
+        )
         self._security_messages = SecurityMessageService(log)
         self._session_folder_sync = SessionFolderSyncService(
             session_path_candidates=self._session_path_candidates,
@@ -99,8 +106,10 @@ class TgClientManager:
             start_client=self.start_client,
             logger=log,
         )
-        # Compatibility aliases for older internal tests/callers while the
-        # service owns the actual collections.
+        # Compatibility aliases for older internal tests/callers while focused
+        # services own the actual collections.
+        self._pending = self._phone_login.pending
+        self._phone_locks = self._phone_login.locks
         self._service_handlers = self._security_messages.handlers
         self._new_msg_callbacks = self._security_messages.callbacks
         self.auto_reconnect = True
@@ -636,9 +645,7 @@ class TgClientManager:
 
     async def cleanup_expired_pending(self):
         now = time.monotonic()
-        for phone, entry in list(self._pending.items()):
-            if entry.get('expires_at', 0) <= now:
-                await self._kill_pending(phone)
+        await self._phone_login.cleanup_expired()
         for qr_id, entry in list(self._qr_pending.items()):
             if entry.get('expires_at', 0) <= now:
                 entry['error'] = entry.get('error') or "QR code expired"
@@ -654,130 +661,44 @@ class TgClientManager:
                 self._qr_locks.pop(qr_id, None)
 
     async def send_code(self, phone: str) -> str:
-        if not settings.api_configured:
-            raise RuntimeError(
-                "TG_API_ID / TG_API_HASH are not set in backend/.env — cannot request a code.\n"
-                "Get your credentials from https://my.telegram.org and fill them in."
-            )
-        phone = self.normalize_phone(phone)
         await self.cleanup_expired_pending()
-        lock = self._phone_locks.setdefault(phone, asyncio.Lock())
-        async with lock:
-            if phone in self._pending:
-                raise RuntimeError("A login request is already pending for this phone")
-            session_path = self._phone_temp_session_path(phone)
-            cli = TelegramClient(session_path, settings.tg_api_id, settings.TG_API_HASH)
-            keep = False
-            try:
-                await asyncio.wait_for(
-                    cli.connect(), timeout=float(settings.TELEGRAM_CONNECT_TIMEOUT)
-                )
-                sent = await asyncio.wait_for(cli.send_code_request(phone), timeout=30)
-                self._pending[phone] = {
-                    'client': cli,
-                    'phone_code_hash': sent.phone_code_hash,
-                    'needs_2fa': False,
-                    'authorized': False,
-                    'session_path': session_path,
-                    'expires_at': time.monotonic() + max(30, int(settings.LOGIN_PENDING_TTL_SECONDS)),
-                }
-                keep = True
-                return sent.phone_code_hash
-            finally:
-                if not keep:
-                    await self._safe_disconnect(
-                        cli,
-                        context=f"send_code_cleanup:{phone}",
-                        suppress_cancelled=True,
-                    )
-                    self._remove_session_files(session_path)
+        return await self._phone_login.send_code(phone)
 
-    async def submit_code(self, phone: str, code: str) -> tuple[TgUser | None, bool]:
-        """Returns (user, needs_2fa). If needs_2fa=True, user is None and the
-        client is kept alive for a follow-up submit_2fa call."""
-        from telethon.errors import SessionPasswordNeededError
-        phone = self.normalize_phone(phone)
+    async def submit_code(
+        self,
+        phone: str,
+        code: str,
+    ) -> tuple[TgUser | None, bool]:
         await self.cleanup_expired_pending()
-        pend = self._pending.get(phone)
-        if not pend:
-            raise RuntimeError("No pending login. Send code first.")
-        cli: TelegramClient = pend['client']
-        try:
-            await asyncio.wait_for(
-                cli.sign_in(phone=phone, code=code, phone_code_hash=pend['phone_code_hash']),
-                timeout=30,
-            )
-        except SessionPasswordNeededError:
-            pend['needs_2fa'] = True
-            return None, True
-        except Exception:
-            # On hard error, give up the pending session so user can re-send code
-            await self._kill_pending(phone)
-            raise
-        me = await cli.get_me()
-        pend['authorized'] = True
-        pend['me'] = me
-        # Keep the disconnected temp file until the transactional DB/session
-        # promotion succeeds; it is bounded by the pending TTL.
-        await self._safe_disconnect(
-            cli,
-            context=f"submit_code_complete:{phone}",
-            suppress_cancelled=True,
-        )
-        return me, False
+        return await self._phone_login.submit_code(phone, code)
 
     async def submit_2fa(self, phone: str, password: str) -> TgUser:
-        phone = self.normalize_phone(phone)
         await self.cleanup_expired_pending()
-        pend = self._pending.get(phone)
-        if not pend:
-            raise RuntimeError("No pending 2FA session. Send code first.")
-        cli: TelegramClient = pend['client']
-        # Keep the pending session on authentication/network failure so the user
-        # can retry; there is no cleanup here, so no catch-and-reraise is needed.
-        await asyncio.wait_for(cli.sign_in(password=password), timeout=30)
-        me = await cli.get_me()
-        # Remember this 2FA password locally so bulk ops can reuse it.
-        try:
-            await secrets_store.save_2fa(phone, password)
-        except (OSError, RuntimeError, ValueError) as exc:
-            log.warning(
-                "phone=%s secure 2FA password save failed error=%s",
-                self._phone_file_part(phone)[-4:],
-                type(exc).__name__,
-            )
-        pend['authorized'] = True
-        pend['me'] = me
-        await self._safe_disconnect(
-            cli,
-            context=f"submit_2fa_complete:{phone}",
-            suppress_cancelled=True,
-        )
-        return me
+        return await self._phone_login.submit_2fa(phone, password)
 
     async def cancel_pending(self, phone: str):
-        await self._kill_pending(self.normalize_phone(phone))
+        return await self._phone_login.cancel(phone)
 
     def phone_session_source(self, phone: str) -> str:
-        phone = self.normalize_phone(phone)
-        entry = self._pending.get(phone)
-        if not entry or not entry.get('authorized'):
-            raise RuntimeError("Phone login session is not ready")
-        return entry['session_path']
+        return self._phone_login.session_source(phone)
 
     async def finish_phone_login(self, phone: str, *, remove_session: bool):
-        await self._kill_pending(self.normalize_phone(phone), remove_session=remove_session)
+        return await self._phone_login.finish(
+            phone,
+            remove_session=remove_session,
+        )
 
-    async def _kill_pending(self, phone: str, disconnect: bool = True, remove_session: bool = True):
-        pend = self._pending.pop(phone, None)
-        if pend and disconnect:
-            await self._safe_disconnect(
-                pend.get('client'),
-                context=f"kill_pending:{phone}",
-                suppress_cancelled=True,
-            )
-        if pend and remove_session:
-            self._remove_session_files(pend.get('session_path', ''))
+    async def _kill_pending(
+        self,
+        phone: str,
+        disconnect: bool = True,
+        remove_session: bool = True,
+    ):
+        return await self._phone_login.kill_pending(
+            phone,
+            disconnect=disconnect,
+            remove_session=remove_session,
+        )
 
     # ---------- QR login flow ----------
     # Telethon's `qr_login()` returns a QRLogin object. Its `url` field is a
