@@ -5,14 +5,28 @@
 ![Local](https://img.shields.io/badge/Local-127.0.0.1-BFE7FF?style=for-the-badge&labelColor=1a1a1a&logoColor=1a1a1a)
 ![Backend](https://img.shields.io/badge/Backend-FastAPI-C8F7DC?style=for-the-badge&labelColor=1a1a1a&logoColor=1a1a1a)
 ![Frontend](https://img.shields.io/badge/Frontend-React+%2B+Vite-FFF0B8?style=for-the-badge&labelColor=1a1a1a&logoColor=1a1a1a)
-![Desktop](https://img.shields.io/badge/Desktop-Windows+BAT-FFC7C7?style=for-the-badge&labelColor=1a1a1a&logoColor=1a1a1a)
+![Desktop](https://img.shields.io/badge/Desktop-Windows+EXE-FFC7C7?style=for-the-badge&labelColor=1a1a1a&logoColor=1a1a1a)
 
 </div>
 
-## Windows runtime data
+## Windows Desktop runtime data
 
-Run `START.bat`. Production releases include the built frontend, so end users
-do not need Node.js. Runtime data is isolated from source code:
+Windows Desktop releases run in their own native application window. End users
+do not need Python, Node.js, PowerShell, or `START.bat`.
+
+Desktop runtime data is stored under the current Windows user's local profile:
+
+```text
+%LOCALAPPDATA%\MultiTGManager\
+  backend\.env
+  data\database\app.db
+  data\sessions\*.session
+  data\secrets\twofa.bin
+  data\backups\<timestamp>\
+  data\logs\app.log
+```
+
+The source/developer launcher still uses the repository-local `data/` layout:
 
 ```text
 data/
@@ -49,7 +63,7 @@ SOAK_TEST.bat -Mode health -Minutes 30 -IntervalSeconds 2
 ```
 
 The health soak requires Multi TG Manager to already be running on `127.0.0.1:8000`.
-Create a sanitized Windows release with `BUILD_RELEASE.bat`.
+Create the legacy/source ZIP with `BUILD_RELEASE.bat`. Build native Windows Desktop EXEs with `build_desktop.ps1` on Windows.
 
 <div align="center">
 <i>A private local dashboard for account status, profile edits, groups, messages, security alerts, and bulk Telegram account actions.</i>
@@ -61,7 +75,7 @@ Create a sanitized Windows release with `BUILD_RELEASE.bat`.
 
 | Feature | What it does |
 | --- | --- |
-| One-click Windows start | `start.bat` creates the venv, installs the exact lockfile, serves the bundled frontend, and opens the app. A source checkout auto-builds the frontend with `npm ci` when needed. |
+| Windows Desktop | Installer and single-file Portable EXE open the dashboard in a native desktop window and embed the Python backend/runtime. |
 | Local-only server | Runs on `127.0.0.1`, so the dashboard is not exposed to the internet. |
 | Telegram sessions | Uses Telethon session files stored under `data/sessions/`, outside the source tree. |
 | Bulk tools | Bulk names, bios, profile photos, joins, leaves, message actions, and security checks. |
@@ -69,23 +83,38 @@ Create a sanitized Windows release with `BUILD_RELEASE.bat`.
 
 ---
 
-## Download and Run
+## Download and Run — Windows Desktop
+
+Choose one of the Windows x64 release files:
 
 ```text
-1. Install Python 3.10+ from https://python.org and tick Add Python to PATH.
-2. Download a release ZIP (Node.js is not required for releases).
-3. Open the folder and double-click start.bat.
-4. Fill backend\.env when Notepad opens.
-5. Save, close Notepad, and double-click start.bat again.
+MultiTGManager-Setup-1.0.0-x64.exe
+  -> Recommended. Installs the app, Start Menu entry, and Desktop shortcut.
+
+MultiTGManager-Portable-1.0.0-x64.exe
+  -> No installation. Double-click the single EXE to run.
 ```
 
-The app opens at `http://localhost:8000`.
+On the first launch, a small setup window asks for:
+
+```text
+Telegram API ID
+Telegram API Hash
+Dashboard Password
+```
+
+The application generates its own session secret and stores configuration only
+under `%LOCALAPPDATA%\MultiTGManager`. The dashboard then opens inside the
+Windows desktop application window. Python and Node.js are not required.
+
+The local backend remains bound only to `127.0.0.1:8000`.
 
 ---
 
-## Setup
+## Source / developer setup
 
-Fill these values in `backend/.env`:
+When running from source rather than the Windows Desktop EXE, fill these values
+in `backend/.env`:
 
 ```env
 TG_API_ID=your_api_id_from_my_telegram_org
