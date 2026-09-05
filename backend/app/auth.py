@@ -37,9 +37,9 @@ def _verify_password(pw: str) -> bool:
         return False
     try:
         material = hashlib.sha256(pw.encode("utf-8")).digest()
-        return bcrypt.checkpw(material, _password_hash())
-    except Exception:
+    except UnicodeError:
         return False
+    return bcrypt.checkpw(material, _password_hash())
 
 
 def verify_app_password(pw: str) -> bool:
@@ -71,9 +71,7 @@ def _verify_token(token: str) -> bool:
         max_age = max(1, settings.SESSION_DAYS) * 86400
         _get_signer().unsign(token, max_age=max_age)
         return True
-    except (BadSignature, SignatureExpired):
-        return False
-    except Exception:
+    except (BadSignature, SignatureExpired, UnicodeError):
         return False
 
 
