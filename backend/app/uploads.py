@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import warnings
 
 from fastapi import HTTPException, UploadFile
 
@@ -49,12 +50,22 @@ async def read_limited(
 
 
 def validate_image_bytes(data: bytes):
+    from PIL import Image, UnidentifiedImageError
+
     try:
-        from PIL import Image
-        with Image.open(io.BytesIO(data)) as image:
-            image.verify()
-            image_format = (image.format or "").upper()
-    except Exception:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                image.verify()
+                image_format = (image.format or "").upper()
+    except (
+        UnidentifiedImageError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        OSError,
+        SyntaxError,
+        ValueError,
+    ):
         raise HTTPException(415, "Uploaded file is not a valid image")
     if image_format not in ALLOWED_IMAGE_FORMATS:
         raise HTTPException(415, "Only JPEG, PNG and WEBP images are allowed")
