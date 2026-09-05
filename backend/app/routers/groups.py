@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
@@ -9,6 +10,7 @@ from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelReque
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 from telethon.errors import (
     FloodWaitError, UserAlreadyParticipantError, InviteHashExpiredError, UserNotParticipantError,
+    RPCError,
 )
 from time import time
 
@@ -28,6 +30,7 @@ except ImportError:  # pragma: no cover
     InviteRequestSentError = None
 
 router = APIRouter(prefix="/api/groups", tags=["groups"])
+log = logging.getLogger("groups")
 
 # crude 5-min cache: account_id -> (ts, list)
 _cache: dict[int, tuple[float, list[dict]]] = {}
@@ -211,7 +214,13 @@ async def _leave_by_target_with_client(cli, target: str) -> BulkResult:
         # Private link: CheckChatInvite tells us if we're already in (has .chat).
         try:
             inv = await cli(CheckChatInviteRequest(payload))
-        except Exception:
+        except FloodWaitError:
+            raise
+        except RPCError as exc:
+            log.info(
+                "invite membership check rejected error_type=%s",
+                type(exc).__name__,
+            )
             return skipped_result("groups.invalidInvite")
         entity = getattr(inv, "chat", None)
         if entity is None:
@@ -219,7 +228,13 @@ async def _leave_by_target_with_client(cli, target: str) -> BulkResult:
     else:
         try:
             entity = await cli.get_entity(payload)
-        except Exception:
+        except FloodWaitError:
+            raise
+        except (RPCError, ValueError) as exc:
+            log.info(
+                "group target resolution failed error_type=%s",
+                type(exc).__name__,
+            )
             return skipped_result("groups.cantResolveTarget")
 
     if isinstance(entity, (Channel, ChannelForbidden)):
@@ -228,15 +243,26 @@ async def _leave_by_target_with_client(cli, target: str) -> BulkResult:
             await cli(GetParticipantRequest(entity, "me"))
         except UserNotParticipantError:
             return skipped_result("groups.notMember")
-        except Exception:
-            pass  # check unavailable — fall through and attempt the leave
+        except FloodWaitError:
+            raise
+        except RPCError as exc:
+            # Some Telegram-side permission/state errors can make the membership
+            # probe unavailable even though LeaveChannel still succeeds.
+            log.warning(
+                "group membership probe failed error_type=%s; attempting leave",
+                type(exc).__name__,
+            )
         await cli(LeaveChannelRequest(entity))
     else:
         try:
             await cli.delete_dialog(entity)
         except FloodWaitError:
             raise
-        except Exception:
+        except RPCError as exc:
+            log.info(
+                "group dialog leave rejected error_type=%s",
+                type(exc).__name__,
+            )
             return skipped_result("groups.notMember")
     return ok_result("groups.left")
 
@@ -290,8 +316,14 @@ async def _leave_all_for_client(cli, aid: int) -> BulkResult:
             left += 1
         except FloodWaitError:
             raise
-        except Exception:
+        except RPCError as exc:
             errors += 1
+            log.warning(
+                "bulk leave failed account_id=%s entity_id=%s error_type=%s",
+                aid,
+                getattr(entity, "id", None),
+                type(exc).__name__,
+            )
         await asyncio.sleep(_INTRA_DELAY)
     detail = f"left {left} of {len(entities)}" + (f", {errors} error(s)" if errors else "")
     return ok_result("groups.leaveAllDone", {"left": left, "total": len(entities),
@@ -309,8 +341,16 @@ async def _delete_all_my_messages_for_client(cli, aid: int, max_scan: int) -> Bu
         try:
             async for msg in cli.iter_messages(entity, from_user=me, limit=scan):
                 ids.append(msg.id)
-        except Exception:
-            continue  # can't read this chat (banned/forbidden) — skip it
+        except FloodWaitError:
+            raise
+        except RPCError as exc:
+            log.warning(
+                "bulk message scan skipped account_id=%s entity_id=%s error_type=%s",
+                aid,
+                getattr(entity, "id", None),
+                type(exc).__name__,
+            )
+            continue  # Telegram refused this chat (banned/forbidden) — skip it
         if not ids:
             continue
         deleted_here = 0
@@ -321,8 +361,13 @@ async def _delete_all_my_messages_for_client(cli, aid: int, max_scan: int) -> Bu
                 deleted_here += len(batch)
             except FloodWaitError:
                 raise
-            except Exception:
-                pass
+            except RPCError as exc:
+                log.warning(
+                    "bulk message delete batch failed account_id=%s entity_id=%s error_type=%s",
+                    aid,
+                    getattr(entity, "id", None),
+                    type(exc).__name__,
+                )
         if deleted_here:
             total_deleted += deleted_here
             groups_touched += 1
