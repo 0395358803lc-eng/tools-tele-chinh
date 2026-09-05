@@ -25,14 +25,16 @@ def _dependency_tree_contains(dependant, target) -> bool:
 
 
 class ApiContractTests(unittest.TestCase):
-    def _schema_api_routes(self):
+    def _all_api_routes(self):
         return [
             route
             for route in app.routes
             if isinstance(route, APIRoute)
             and route.path.startswith("/api/")
-            and route.include_in_schema
         ]
+
+    def _schema_api_routes(self):
+        return [route for route in self._all_api_routes() if route.include_in_schema]
 
     def test_no_duplicate_method_path_operations(self):
         seen = {}
@@ -49,14 +51,17 @@ class ApiContractTests(unittest.TestCase):
     def test_public_api_surface_is_explicit_and_small(self):
         operations = {
             (method, route.path)
-            for route in self._schema_api_routes()
+            for route in self._all_api_routes()
+            if route.path != "/api/{rest:path}"
             for method in (route.methods or set())
         }
         missing = PUBLIC_API_OPERATIONS - operations
         self.assertEqual(missing, set(), f"expected public operations missing: {sorted(missing)}")
 
         accidental_public = []
-        for route in self._schema_api_routes():
+        for route in self._all_api_routes():
+            if route.path == "/api/{rest:path}":
+                continue
             protected = _dependency_tree_contains(route.dependant, require_auth)
             for method in route.methods or set():
                 key = (method, route.path)
@@ -71,7 +76,9 @@ class ApiContractTests(unittest.TestCase):
 
     def test_all_non_public_api_operations_require_app_auth(self):
         unprotected = []
-        for route in self._schema_api_routes():
+        for route in self._all_api_routes():
+            if route.path == "/api/{rest:path}":
+                continue
             for method in route.methods or set():
                 key = (method, route.path)
                 if key in PUBLIC_API_OPERATIONS:
