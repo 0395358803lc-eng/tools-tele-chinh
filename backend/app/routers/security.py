@@ -5,8 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from telethon.tl.functions.account import (
     GetAuthorizationsRequest, ResetAuthorizationRequest, GetPasswordRequest,
 )
-from telethon.errors import FloodWaitError, PasswordHashInvalidError
+from telethon.errors import FloodWaitError, PasswordHashInvalidError, RPCError
 from datetime import datetime
+import logging
 
 from ..db import get_db, AsyncSessionLocal
 from ..models import SecurityMessage, Account
@@ -16,6 +17,23 @@ from .. import secrets_store
 from ..utils import bulk_stream, friendly_error, ok_result
 
 router = APIRouter(prefix="/api/security", tags=["security"])
+log = logging.getLogger("security")
+
+
+async def _save_2fa_best_effort(phone: str, password: str) -> bool:
+    """Return True when local persistence failed after Telegram accepted a change."""
+    try:
+        await secrets_store.save_2fa(phone, password)
+        return False
+    except Exception as exc:
+        # This is an explicit compensation boundary: Telegram may already have
+        # changed the password, so a local persistence failure must not recast
+        # that remote success as a failed mutation. Make the failure observable.
+        log.warning(
+            "2FA secret persistence failed error_type=%s",
+            type(exc).__name__,
+        )
+        return True
 
 
 @router.get("/messages", response_model=list[SecurityMessageOut])
@@ -112,13 +130,7 @@ async def bulk_2fa(body: Bulk2faIn, db: AsyncSession = Depends(get_db)):
                 await s.commit()
 
     async def _save_warn(phone: str):
-        """Persist the new password, but never let a save failure mask the fact
-        that Telegram already accepted the change. Returns a warning flag."""
-        try:
-            await secrets_store.save_2fa(phone, new_password)
-            return False
-        except Exception:
-            return True
+        return await _save_2fa_best_effort(phone, new_password)
 
     async def _change(cli, aid):
         phone = phone_by_id.get(aid, "")
@@ -173,8 +185,14 @@ async def _terminate_other_authorizations(cli) -> tuple[int, int]:
         try:
             await cli(ResetAuthorizationRequest(hash=a.hash))
             killed += 1
-        except Exception:
+        except FloodWaitError:
+            raise
+        except RPCError as exc:
             failed += 1
+            log.warning(
+                "terminate other authorization failed error_type=%s",
+                type(exc).__name__,
+            )
     return killed, failed
 
 
