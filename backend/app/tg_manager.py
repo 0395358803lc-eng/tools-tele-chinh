@@ -25,6 +25,7 @@ from .config import settings
 from .account_scheduler import AccountActionScheduler
 from .client_cleanup import TelegramClientCleanup
 from .session_files import SessionFileStore
+from .session_folder_sync import SessionFolderSyncService
 from .security_messages import SecurityMessageService, SERVICE_ID
 from .db import AsyncSessionLocal
 from .models import Account, AppSetting, GoneAccount
@@ -90,6 +91,14 @@ class TgClientManager:
         self._cleanup = TelegramClientCleanup(log)
         self._session_files = SessionFileStore(log)
         self._security_messages = SecurityMessageService(log)
+        self._session_folder_sync = SessionFolderSyncService(
+            session_path_candidates=self._session_path_candidates,
+            inspect_imported_session=self.inspect_imported_session,
+            get_client=self.get,
+            stop_client=self.stop_client,
+            start_client=self.start_client,
+            logger=log,
+        )
         # Compatibility aliases for older internal tests/callers while the
         # service owns the actual collections.
         self._service_handlers = self._security_messages.handlers
@@ -100,8 +109,9 @@ class TgClientManager:
         self._reconnect_exhausted: set[int] = set()
         self._manual_disconnect: set[int] = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._session_scan_lock = asyncio.Lock()
-        self._session_scan_seen: dict[str, tuple[int, int]] = {}
+        # Compatibility aliases while SessionFolderSyncService owns scan state.
+        self._session_scan_lock = self._session_folder_sync.lock
+        self._session_scan_seen = self._session_folder_sync.seen
         self._background_tasks: set[asyncio.Task] = set()
         self._last_auth_check: dict[int, float] = {}
         self._auth_cursor: int = 0
@@ -265,145 +275,15 @@ class TgClientManager:
         return Path(dst).name
 
     @staticmethod
-    def _session_error_detail(e: Exception) -> str:
-        return f"Session import failed ({type(e).__name__})"
+    def _session_error_detail(exc: Exception) -> str:
+        return SessionFolderSyncService.session_error_detail(exc)
 
     @staticmethod
     def _is_importable_session_file(path: Path) -> bool:
-        return SessionFileStore.is_importable_session_file(path)
+        return SessionFolderSyncService.is_importable_session_file(path)
 
     async def sync_session_folder(self, force: bool = False) -> dict:
-        """Discover authorized .session files pasted into the sessions folder.
-
-        This fills missing Account rows without asking for a login code. It does
-        not create a new Telegram auth key; it only reuses session files that are
-        already authorized.
-        """
-        async with self._session_scan_lock:
-            session_files = [
-                p for p in sorted(settings.sessions_path.glob("*.session"))
-                if self._is_importable_session_file(p)
-            ]
-
-            async with AsyncSessionLocal() as db:
-                res = await db.execute(select(Account))
-                accounts = list(res.scalars().all())
-
-            known_paths: set[str] = set()
-            for acc in accounts:
-                for base in self._session_path_candidates(acc):
-                    try:
-                        known_paths.add(str(Path(base + ".session").resolve()).lower())
-                    except (OSError, RuntimeError):
-                        pass
-
-            success = failed = skipped = 0
-            results: list[dict] = []
-
-            for path in session_files:
-                row = {
-                    "filename": path.name,
-                    "phone": "",
-                    "name": "",
-                    "account_id": None,
-                    "status": "failed",
-                    "detail": "",
-                }
-
-                try:
-                    resolved = str(path.resolve()).lower()
-                    if resolved in known_paths:
-                        if force:
-                            row["status"] = "skipped"
-                            row["detail"] = "Already added"
-                            skipped += 1
-                            results.append(row)
-                        continue
-
-                    stat = path.stat()
-                    signature = (int(stat.st_size), int(stat.st_mtime_ns))
-                    if not force and self._session_scan_seen.get(resolved) == signature:
-                        continue
-                    self._session_scan_seen[resolved] = signature
-
-                    session_base = str(path.with_suffix(""))
-                    me, phone = await self.inspect_imported_session(session_base)
-                    display_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or phone
-                    row["phone"] = phone
-                    row["name"] = display_name
-
-                    async with AsyncSessionLocal() as db:
-                        res = await db.execute(select(Account).where(Account.phone == phone))
-                        acc = res.scalar_one_or_none()
-                        replacing = bool(acc)
-
-                        if acc:
-                            candidate_paths = []
-                            for base in self._session_path_candidates(acc):
-                                try:
-                                    candidate_paths.append(str(Path(base + ".session").resolve()).lower())
-                                except (OSError, RuntimeError):
-                                    pass
-                            has_existing_file = any(Path(base + ".session").exists() for base in self._session_path_candidates(acc))
-                            if resolved not in candidate_paths and has_existing_file:
-                                row["status"] = "skipped"
-                                row["detail"] = "Account already exists from another session file"
-                                row["account_id"] = acc.id
-                                skipped += 1
-                                results.append(row)
-                                continue
-                            if self.get(acc.id):
-                                await self.stop_client(acc.id)
-
-                        session_file = path.stem
-                        if not acc:
-                            acc = Account(
-                                phone=phone,
-                                tg_user_id=me.id,
-                                first_name=me.first_name or "",
-                                last_name=me.last_name or "",
-                                username=me.username or "",
-                                session_file=session_file,
-                                status="connected",
-                            )
-                            db.add(acc)
-                        else:
-                            acc.tg_user_id = me.id
-                            acc.first_name = me.first_name or ""
-                            acc.last_name = me.last_name or ""
-                            acc.username = me.username or ""
-                            acc.session_file = session_file
-                            acc.status = "connected"
-
-                        await db.commit()
-                        await db.refresh(acc)
-                        row["account_id"] = acc.id
-
-                    detail = "Updated from sessions folder" if replacing else "Imported from sessions folder"
-                    try:
-                        await self.start_client(acc)
-                    except Exception as start_err:
-                        detail += f"; saved but could not start now: {self._session_error_detail(start_err)}"
-
-                    row["status"] = "ok"
-                    row["detail"] = detail
-                    success += 1
-                    results.append(row)
-                    known_paths.add(resolved)
-                except Exception as e:
-                    row["status"] = "failed"
-                    row["detail"] = self._session_error_detail(e)
-                    failed += 1
-                    results.append(row)
-
-            return {
-                "ok": True,
-                "total": len(session_files),
-                "success": success,
-                "failed": failed,
-                "skipped": skipped,
-                "results": results,
-            }
+        return await self._session_folder_sync.sync(force=force)
 
     def get(self, account_id: int) -> Optional[TelegramClient]:
         return self._clients.get(account_id)
