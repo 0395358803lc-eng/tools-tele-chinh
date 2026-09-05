@@ -88,3 +88,51 @@ jobs:
           if (-not (Test-Path -LiteralPath "backend/static/index.html")) {
             throw "backend/static/index.html was not produced"
           }
+
+      - name: Upload bundled frontend
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-static
+          path: backend/static
+          if-no-files-found: error
+
+  runtime-smoke:
+    name: Real Windows runtime smoke
+    runs-on: windows-latest
+    needs: [backend, frontend]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.lock
+
+      - name: Install exact backend dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.lock
+          python -m pip check
+
+      - name: Restore bundled frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-static
+          path: backend/static
+
+      - name: Run real application smoke test
+        working-directory: backend
+        run: python tests/runtime_smoke.py
+
+      - name: Upload runtime log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-smoke-log
+          path: runtime-smoke-uvicorn.log
+          if-no-files-found: ignore

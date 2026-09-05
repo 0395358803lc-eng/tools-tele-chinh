@@ -161,21 +161,27 @@ async def request_shutdown(request: Request):
 
 
 async def _trigger_graceful_shutdown():
-    """Give the response a moment to flush, then poke uvicorn to stop. On
-    Windows the app runs in its own console so CTRL_BREAK_EVENT is scoped to
-    the server process group and NOT broadcast to the user's other windows."""
-    import signal
+    """Give the response time to flush, then ask the owned Uvicorn Server to exit.
+
+    The canonical runner registers an in-process callback on app.state. This
+    avoids CTRL_BREAK/SIGTERM signals escaping to a parent console or process
+    group while still letting Uvicorn execute the normal lifespan shutdown.
+    """
     await asyncio.sleep(0.5)
+    callback = getattr(app.state, "request_server_shutdown", None)
+    if not callable(callback):
+        log.warning(
+            "graceful shutdown hook is unavailable; run backend/run_server.py "
+            "instead of invoking uvicorn directly"
+        )
+        return
     try:
-        if os.name == "nt":
-            # Python's signal.raise_signal(SIGBREAK) is the equivalent of
-            # sending CTRL_BREAK_EVENT to ourselves; uvicorn treats it as a
-            # graceful stop request on Windows.
-            os.kill(os.getpid(), signal.CTRL_BREAK_EVENT)
-        else:
-            os.kill(os.getpid(), signal.SIGTERM)
-    except OSError as exc:  # pragma: no cover - platform edge
-        log.warning("graceful shutdown signal failed: %s", exc)
+        callback()
+    except Exception as exc:  # lifecycle boundary: never fail the flushed response
+        log.warning(
+            "graceful shutdown hook failed error=%s",
+            type(exc).__name__,
+        )
 
 
 @app.exception_handler(StarletteHTTPException)

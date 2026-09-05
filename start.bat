@@ -201,7 +201,7 @@ start "" cmd /c "timeout /t 4 /nobreak >nul & start http://localhost:8000"
 
 cd /d "!ROOT!\backend"
 set PYTHONUNBUFFERED=1
-"!VENV_PY!" -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --log-level info
+"!VENV_PY!" run_server.py
 
 echo.
 echo Server stopped.
