@@ -67,8 +67,19 @@ jobs:
             Remove-Item -LiteralPath $runtime -Recurse -Force
           }
           $env:MTM_RUNTIME_ROOT = $runtime
-          $process = Start-Process -FilePath "${{ steps.artifacts.outputs.portable }}" -ArgumentList "--smoke-test" -Wait -PassThru
+          $process = Start-Process -FilePath "${{ steps.artifacts.outputs.portable }}" -ArgumentList "--smoke-test" -PassThru
+          try {
+            Wait-Process -Id $process.Id -Timeout 120 -ErrorAction Stop
+          } catch {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            $log = Join-Path $runtime "data\logs\app.log"
+            if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }
+            throw "Portable desktop smoke timed out after 120 seconds"
+          }
+          $process.Refresh()
           if ($process.ExitCode -ne 0) {
+            $log = Join-Path $runtime "data\logs\app.log"
+            if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }
             throw "Portable desktop smoke failed with exit code $($process.ExitCode)"
           }
 
