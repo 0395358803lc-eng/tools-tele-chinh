@@ -356,6 +356,19 @@ class StartupAndListenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(second.added), 1)
 
 
+class LauncherRegressionTests(unittest.TestCase):
+    def test_start_uses_owned_server_runner_and_release_packages_it(self):
+        start_text = (PROJECT_ROOT / "start.bat").read_text(encoding="utf-8")
+        build_text = (PROJECT_ROOT / "build_release.ps1").read_text(encoding="utf-8")
+        main_text = (PROJECT_ROOT / "backend" / "app" / "main.py").read_text(encoding="utf-8")
+
+        self.assertIn('"!VENV_PY!" run_server.py', start_text)
+        self.assertNotIn("-m uvicorn app.main:app", start_text)
+        self.assertIn('backend\\run_server.py', build_text)
+        self.assertNotIn("CTRL_BREAK_EVENT", main_text)
+        self.assertNotIn("SIGBREAK", main_text)
+
+
 class ValidationAndMigrationTests(unittest.TestCase):
     def test_phone_and_bulk_ids_are_normalized(self):
         self.assertEqual(SendCodeIn(phone="(84) 123-456-789").phone, "+84123456789")
