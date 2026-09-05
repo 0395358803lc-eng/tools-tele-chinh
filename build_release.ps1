@@ -47,6 +47,7 @@ Copy-Item (Join-Path $Root "backend\requirements.txt") (Join-Path $Target "backe
 Copy-Item (Join-Path $Root "backend\requirements.lock") (Join-Path $Target "backend\requirements.lock")
 Copy-Item (Join-Path $Root "backend\.env.example") (Join-Path $Target "backend\.env.example")
 Copy-Item (Join-Path $Root "backend\check_env.ps1") (Join-Path $Target "backend\check_env.ps1")
+Copy-Item (Join-Path $Root "backend\run_server.py") (Join-Path $Target "backend\run_server.py")
 Copy-Item (Join-Path $Root "start.bat") (Join-Path $Target "START.bat")
 Copy-Item (Join-Path $Root "stop.bat") (Join-Path $Target "STOP.bat")
 $OptionalRootFiles = @("RESTORE_BACKUP.bat", "SOAK_TEST.bat", "soak_test.ps1")
