@@ -2,7 +2,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 from .config import settings
-from .config import PROJECT_ROOT
+from .config import BACKEND_ROOT
 
 
 class Base(DeclarativeBase):
@@ -55,7 +55,10 @@ async def run_migrations():
     from alembic.script import ScriptDirectory
     from sqlalchemy import create_engine, inspect as sa_inspect
 
-    config = Config(str(PROJECT_ROOT / "backend" / "alembic.ini"))
+    config = Config(str(BACKEND_ROOT / "alembic.ini"))
+    # The desktop executable can run from any working directory, so never
+    # resolve Alembic scripts relative to cwd.
+    config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     root_rev = None
     for rev in script.walk_revisions():

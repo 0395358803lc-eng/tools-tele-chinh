@@ -2,12 +2,23 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 import logging
+import os
 import shutil
 import sqlite3
 
 log = logging.getLogger("config")
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_ROOT = PROJECT_ROOT / "data"
+BACKEND_ROOT = Path(
+    os.environ.get("MTM_BACKEND_ROOT")
+    or Path(__file__).resolve().parents[1]
+).resolve()
+PROJECT_ROOT = BACKEND_ROOT.parent
+RUNTIME_ROOT = Path(
+    os.environ.get("MTM_RUNTIME_ROOT")
+    or PROJECT_ROOT
+).resolve()
+RUNTIME_BACKEND_ROOT = RUNTIME_ROOT / "backend"
+ENV_FILE = RUNTIME_BACKEND_ROOT / ".env"
+DATA_ROOT = RUNTIME_ROOT / "data"
 DATABASE_DIR = DATA_ROOT / "database"
 SESSIONS_DIR = DATA_ROOT / "sessions"
 SECRETS_DIR = DATA_ROOT / "secrets"
@@ -16,7 +27,7 @@ LOGS_DIR = DATA_ROOT / "logs"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=str(ENV_FILE), extra="ignore")
 
     # Held as a plain string so an empty/malformed value in .env doesn't crash
     # the app during Settings() construction with a raw pydantic traceback.
@@ -128,7 +139,7 @@ settings = Settings()
 def migrate_legacy_runtime_data():
     """Copy legacy backend runtime files into data/ without deleting originals."""
     settings.ensure_data_directories()
-    legacy_backend = PROJECT_ROOT / "backend"
+    legacy_backend = BACKEND_ROOT
     old_db = legacy_backend / "app.db"
     new_db = settings.database_path
     if old_db.exists() and not new_db.exists():

@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .config import migrate_legacy_runtime_data, settings
+from .config import BACKEND_ROOT, migrate_legacy_runtime_data, settings
 from .db import AsyncSessionLocal, check_database_integrity, init_db, run_migrations, shutdown_db
 from .models import Account
 from .errors import resolve_error
@@ -280,7 +280,7 @@ async def api_not_found(rest: str):
 
 # ---- serve built frontend (single-port mode) ----
 # `start.bat` builds the frontend into backend/static/. If that folder exists, serve it.
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+STATIC_DIR = BACKEND_ROOT / "static"
 
 if STATIC_DIR.is_dir():
     assets_dir = STATIC_DIR / "assets"
