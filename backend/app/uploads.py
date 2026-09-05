@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import re
+from pathlib import Path
 
 from fastapi import HTTPException, UploadFile
 
 from .config import settings
+
+log = logging.getLogger("uploads")
 
 SESSION_MAX_BYTES = max(1, int(settings.MAX_SESSION_UPLOAD_MB)) * 1024 * 1024
 IMAGE_MAX_BYTES = max(1, int(settings.MAX_IMAGE_UPLOAD_MB)) * 1024 * 1024
@@ -69,3 +73,20 @@ def ensure_image_upload(upload: UploadFile):
     if content_type.startswith("image/") or _ext_of(upload) in ALLOWED_IMAGE_EXTS:
         return
     raise HTTPException(415, "Only image files (jpg/png/webp) are allowed")
+
+
+
+def cleanup_temp_files(paths: list[str]) -> None:
+    """Best-effort removal for staged upload files with observable failures."""
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        path = Path(raw_path)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning(
+                "temporary upload cleanup failed file=%s error=%s",
+                path.name,
+                type(exc).__name__,
+            )
