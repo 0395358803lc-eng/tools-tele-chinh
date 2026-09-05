@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import json
+import logging
 import os
 import re
 from ctypes import wintypes
@@ -29,7 +30,9 @@ from pathlib import Path
 
 from .config import PROJECT_ROOT, settings
 
+log = logging.getLogger("secrets_store")
 _lock = asyncio.Lock()
+_EXPECTED_STORE_ERRORS = (OSError, UnicodeError, json.JSONDecodeError, RuntimeError)
 
 # ---------------------------------------------------------------------------
 # DPAPI via ctypes — avoids a hard dependency on pywin32.
@@ -151,7 +154,11 @@ def _remove_legacy_plaintext_if_covered(secure_data: dict[str, str]) -> bool:
         return False
     try:
         old_data = _clean_mapping(json.loads(legacy.read_text(encoding="utf-8") or "{}"))
-    except Exception:
+    except _EXPECTED_STORE_ERRORS as exc:
+        log.warning(
+            "legacy 2FA plaintext retained stage=duplicate_read error_type=%s",
+            type(exc).__name__,
+        )
         return False
     if not all(secure_data.get(key) == value for key, value in old_data.items()):
         return False
@@ -247,10 +254,14 @@ async def migrate_legacy():
             # Upgrade path for users who already migrated data/secrets/twofa.json
             # with an older build but still have the duplicated backend copy.
             _remove_legacy_plaintext_if_covered(existing)
-    except Exception:
-        # Leave every plaintext source in place on any ambiguity/failure. Data
-        # retention is safer than deleting the user's only usable 2FA password.
-        pass
+    except _EXPECTED_STORE_ERRORS as exc:
+        # Leave every plaintext source in place on expected data/I/O/DPAPI
+        # ambiguity. Unexpected programming errors intentionally propagate so a
+        # broken migration cannot masquerade as a successful startup.
+        log.warning(
+            "legacy 2FA migration deferred error_type=%s",
+            type(exc).__name__,
+        )
 
 
 async def save_2fa(phone: str, password: str):
