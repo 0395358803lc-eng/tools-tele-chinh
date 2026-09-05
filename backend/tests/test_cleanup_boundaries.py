@@ -3,8 +3,10 @@ import asyncio
 import sqlite3
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.tg_manager import TgClientManager
+from app.routers import bulk
 
 
 class _FakeClient:
@@ -94,7 +96,43 @@ class CleanupBoundaryTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class BulkTempCleanupTests(unittest.TestCase):
+    def test_expected_os_cleanup_failure_is_logged_and_contained(self):
+        with patch("app.routers.bulk.os.unlink", side_effect=PermissionError("locked")):
+            with self.assertLogs("bulk", level="WARNING") as captured:
+                bulk._cleanup_temp_file(r"C:\\Temp\\photo-123.jpg")
+        self.assertTrue(
+            any("bulk photo temp cleanup failed" in line for line in captured.output)
+        )
+
+    def test_missing_temp_file_is_already_clean(self):
+        with patch("app.routers.bulk.os.unlink", side_effect=FileNotFoundError()):
+            bulk._cleanup_temp_file(r"C:\\Temp\\already-gone.jpg")
+
+    def test_unexpected_cleanup_programming_error_is_not_swallowed(self):
+        with patch("app.routers.bulk.os.unlink", side_effect=RuntimeError("bug")):
+            with self.assertRaises(RuntimeError):
+                bulk._cleanup_temp_file(r"C:\\Temp\\photo-123.jpg")
+
+
 class CleanupSourceGuardTests(unittest.TestCase):
+    def test_bulk_router_has_no_silent_broad_exception_pass(self):
+        source_path = Path(__file__).resolve().parents[1] / "app" / "routers" / "bulk.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ExceptHandler) or node.type is None:
+                continue
+            catches_exception = isinstance(node.type, ast.Name) and node.type.id == "Exception"
+            if isinstance(node.type, ast.Tuple):
+                catches_exception = any(
+                    isinstance(item, ast.Name) and item.id == "Exception"
+                    for item in node.type.elts
+                )
+            if catches_exception and len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
+                offenders.append(getattr(node, "lineno", -1))
+        self.assertEqual(offenders, [], f"silent broad exception handlers at lines {offenders}")
+
     def test_tg_manager_has_no_silent_broad_exception_pass(self):
         source_path = Path(__file__).resolve().parents[1] / "app" / "tg_manager.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
