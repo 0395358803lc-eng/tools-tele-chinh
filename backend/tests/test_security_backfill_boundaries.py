@@ -143,15 +143,30 @@ class SecurityBackfillSourceGuardTests(unittest.TestCase):
         source_path = Path(__file__).resolve().parents[1] / "app" / "security_messages.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
         offenders = []
+        found = False
         for node in ast.walk(tree):
-            if not isinstance(node, ast.AsyncFunctionDef) or node.name != "_backfill_777000":
+            if not isinstance(node, ast.AsyncFunctionDef) or node.name != "backfill":
                 continue
+            found = True
             for child in ast.walk(node):
                 if not isinstance(child, ast.ExceptHandler) or child.type is None:
                     continue
                 if isinstance(child.type, ast.Name) and child.type.id == "Exception":
                     offenders.append(getattr(child, "lineno", -1))
+        self.assertTrue(found, "SecurityMessageService.backfill missing")
         self.assertEqual(offenders, [], f"broad backfill exception handlers: {offenders}")
+
+    def test_tg_manager_keeps_only_security_message_compatibility_wrappers(self):
+        app_root = Path(__file__).resolve().parents[1] / "app"
+        manager_source = (app_root / "tg_manager.py").read_text(encoding="utf-8")
+        service_source = (app_root / "security_messages.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("SecurityMessage(", manager_source)
+        self.assertNotIn("events.NewMessage", manager_source)
+        self.assertIn("SecurityMessage(", service_source)
+        self.assertIn("events.NewMessage", service_source)
+        self.assertIn("self._security_messages.backfill", manager_source)
+        self.assertIn("self._security_messages.attach", manager_source)
 
 
 if __name__ == "__main__":
