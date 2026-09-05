@@ -457,6 +457,39 @@ class TgClientManager:
         settings.CONCURRENCY = _int("concurrency", settings.CONCURRENCY)
         self.auto_reconnect = values.get("auto_reconnect", "true").lower() == "true"
 
+    def _background_task_done(self, task: asyncio.Task, *, name: str):
+        """Remove a finished task and report unexpected task failure safely."""
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as probe_exc:
+            log.warning(
+                "background task inspection failed name=%s error_type=%s",
+                name,
+                type(probe_exc).__name__,
+            )
+            return
+        if exc is not None:
+            log.warning(
+                "background task failed name=%s error_type=%s",
+                name,
+                type(exc).__name__,
+            )
+
+    def _track_background_task(self, task: asyncio.Task, *, name: str) -> asyncio.Task:
+        self._background_tasks.add(task)
+        task.add_done_callback(
+            lambda done, task_name=name: self._background_task_done(
+                done,
+                name=task_name,
+            )
+        )
+        return task
+
     async def startup_load_all(self):
         """Load settings and optionally connect previously-authorized accounts."""
         await self.redact_stored_login_codes()
@@ -481,8 +514,12 @@ class TgClientManager:
             async with sem:
                 try:
                     await self.start_client(acc)
-                except Exception as e:
-                    log.warning("Failed to start client for %s: %s", acc.phone, e)
+                except Exception as exc:
+                    log.warning(
+                        "startup client failed account=%s error_type=%s",
+                        acc.id,
+                        type(exc).__name__,
+                    )
 
         eligible = [
             acc for acc in accounts
@@ -490,9 +527,10 @@ class TgClientManager:
         ]
         await asyncio.gather(*(_start_one(acc) for acc in eligible))
 
-        janitor = asyncio.create_task(self._pending_janitor())
-        self._background_tasks.add(janitor)
-        janitor.add_done_callback(self._background_tasks.discard)
+        self._track_background_task(
+            asyncio.create_task(self._pending_janitor()),
+            name="pending_janitor",
+        )
 
         async def _sync_pasted_sessions():
             try:
@@ -504,12 +542,16 @@ class TgClientManager:
                         report.get("failed", 0),
                         report.get("skipped", 0),
                     )
-            except Exception as e:
-                log.warning("session folder sync failed: %s", e)
+            except Exception as exc:
+                log.warning(
+                    "session folder sync failed error_type=%s",
+                    type(exc).__name__,
+                )
 
-        sync_task = asyncio.create_task(_sync_pasted_sessions())
-        self._background_tasks.add(sync_task)
-        sync_task.add_done_callback(self._background_tasks.discard)
+        self._track_background_task(
+            asyncio.create_task(_sync_pasted_sessions()),
+            name="session_folder_sync",
+        )
 
     async def shutdown(self, action_timeout: float = 30.0):
         self._action_scheduler.stop_accepting()
