@@ -87,7 +87,7 @@ class BackgroundDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         manager = TgClientManager()
         with (
             patch(
-                "app.tg_manager.AsyncSessionLocal",
+                "app.security_messages.AsyncSessionLocal",
                 side_effect=RuntimeError("sensitive-marker"),
             ),
             self.assertLogs("tg_manager", level="WARNING") as captured,
@@ -102,8 +102,8 @@ class BackgroundDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
     async def test_backfill_iterator_failure_is_contained_without_raw_error(self):
         manager = TgClientManager()
         with (
-            patch("app.tg_manager.RPCError", _ExpectedRpcError),
-            patch("app.tg_manager.AsyncSessionLocal", return_value=_ReadSession()),
+            patch("app.security_messages.RPCError", _ExpectedRpcError),
+            patch("app.security_messages.AsyncSessionLocal", return_value=_ReadSession()),
             self.assertLogs("tg_manager", level="WARNING") as captured,
         ):
             await manager._backfill_777000(
@@ -123,16 +123,16 @@ class BackgroundDiagnosticsSourceGuardTests(unittest.TestCase):
         main_source = (
             Path(__file__).resolve().parents[1] / "app" / "main.py"
         ).read_text(encoding="utf-8")
-        tg_source = (
-            Path(__file__).resolve().parents[1] / "app" / "tg_manager.py"
+        security_source = (
+            Path(__file__).resolve().parents[1] / "app" / "security_messages.py"
         ).read_text(encoding="utf-8")
 
         self.assertNotIn('log.warning("status refresh: %s", e)', main_source)
-        self.assertNotIn('log.warning("login-code redaction skipped: %s", e)', tg_source)
-        self.assertNotIn('log.exception("777000 handler failed: %s", e)', tg_source)
+        self.assertNotIn('log.warning("login-code redaction skipped: %s", e)', security_source)
+        self.assertNotIn('log.exception("777000 handler failed: %s", e)', security_source)
         self.assertNotIn(
             'log.warning("backfill iter failed for account %s: %s", account_id, e)',
-            tg_source,
+            security_source,
         )
 
     def test_status_tick_keeps_explicit_resilience_boundary(self):

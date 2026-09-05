@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.errors import (
     AuthKeyUnregisteredError,
     UserDeactivatedBanError,
@@ -20,26 +20,25 @@ from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRe
 from telethon.tl.functions.photos import UploadProfilePhotoRequest
 from telethon.tl.types import User as TgUser
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 
 from .config import settings
 from .account_scheduler import AccountActionScheduler
 from .client_cleanup import TelegramClientCleanup
 from .session_files import SessionFileStore
+from .security_messages import SecurityMessageService, SERVICE_ID
 from .db import AsyncSessionLocal
-from .models import Account, AppSetting, SecurityMessage, GoneAccount
+from .models import Account, AppSetting, GoneAccount
 from . import secrets_store
 from .time_utils import utc_now_naive
 from .tg_utils import (
     RECONNECT_BACKOFF_SECONDS,
-    classify_777000,
+    classify_777000,  # compatibility re-export for existing callers/tests
     permanent_connection_status,
     redact_login_code,
 )
 
 log = logging.getLogger("tg_manager")
 
-SERVICE_ID = 777000
 T = TypeVar("T")
 
 
@@ -79,7 +78,6 @@ class TgClientManager:
         self._phone_locks: dict[str, asyncio.Lock] = {}
         self._qr_locks: dict[str, asyncio.Lock] = {}
         self._qr_completed: dict[str, tuple[float, dict]] = {}
-        self._service_handlers: dict[int, tuple[TelegramClient, object]] = {}
         # Per-account locks so two calls can't start/stop the SAME account at
         # once, while DIFFERENT accounts still connect concurrently (a single
         # global lock would serialize all 100+ accounts on boot).
@@ -91,13 +89,17 @@ class TgClientManager:
         self._action_scheduler = AccountActionScheduler(log)
         self._cleanup = TelegramClientCleanup(log)
         self._session_files = SessionFileStore(log)
+        self._security_messages = SecurityMessageService(log)
+        # Compatibility aliases for older internal tests/callers while the
+        # service owns the actual collections.
+        self._service_handlers = self._security_messages.handlers
+        self._new_msg_callbacks = self._security_messages.callbacks
         self.auto_reconnect = True
         self._reconnect_attempts: dict[int, int] = {}
         self._reconnect_at: dict[int, float] = {}
         self._reconnect_exhausted: set[int] = set()
         self._manual_disconnect: set[int] = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._new_msg_callbacks: list = []
         self._session_scan_lock = asyncio.Lock()
         self._session_scan_seen: dict[str, tuple[int, int]] = {}
         self._background_tasks: set[asyncio.Task] = set()
@@ -411,28 +413,7 @@ class TgClientManager:
 
     # ---------- lifecycle ----------
     async def redact_stored_login_codes(self):
-        """One-time migration: scrub any OTP digits that a previous version stored
-        inside type='login_code' SecurityMessage rows. Runs on every boot but is a
-        no-op once no legacy digits remain."""
-        try:
-            async with AsyncSessionLocal() as db:
-                res = await db.execute(
-                    select(SecurityMessage).where(SecurityMessage.type == "login_code")
-                )
-                changed = 0
-                for sm in res.scalars().all():
-                    cleaned = redact_login_code(sm.message_text or "")
-                    if cleaned != sm.message_text:
-                        sm.message_text = cleaned
-                        changed += 1
-                if changed:
-                    await db.commit()
-                    log.info("redacted OTP digits from %d stored 777000 login messages", changed)
-        except Exception as exc:
-            log.warning(
-                "login-code redaction skipped error_type=%s",
-                type(exc).__name__,
-            )
+        return await self._security_messages.redact_stored_login_codes()
 
     async def load_runtime_settings(self):
         """Apply persisted settings before any Telegram client is created."""
@@ -568,7 +549,7 @@ class TgClientManager:
             )
         for cli in list(self._clients.values()):
             await self._safe_disconnect(cli, context="shutdown:active_client")
-        self._service_handlers.clear()
+        self._security_messages.clear_handlers()
         for pend in list(self._pending.values()):
             await self._safe_disconnect(
                 pend.get('client'),
@@ -714,8 +695,12 @@ class TgClientManager:
                 await asyncio.wait_for(
                     self._backfill_777000(acc.id, cli, limit=50), timeout=30
                 )
-            except Exception as e:
-                log.warning("backfill 777000 for %s: %s", acc.phone, e)
+            except Exception as exc:
+                log.warning(
+                    "startup backfill failed account=%s error_type=%s",
+                    acc.id,
+                    type(exc).__name__,
+                )
             return cli
 
     async def stop_client(self, account_id: int):
@@ -725,14 +710,10 @@ class TgClientManager:
             async with lock:
                 cli = self._clients.pop(account_id, None)
             if cli:
-                handler_entry = self._service_handlers.pop(account_id, None)
-                if handler_entry:
-                    old_cli, handler = handler_entry
-                    self._safe_remove_event_handler(
-                        old_cli,
-                        handler,
-                        context=f"stop_client:{account_id}",
-                    )
+                self._security_messages.detach(
+                    account_id,
+                    context=f"stop_client:{account_id}",
+                )
                 await self._safe_disconnect(
                     cli,
                     context=f"stop_client:{account_id}",
@@ -1177,74 +1158,15 @@ class TgClientManager:
     def _safe_unlink(self, path: str):
         self._session_files.safe_unlink(path)
 
-    # ---------- listener ----------
+    # ---------- 777000 security messages ----------
     def _attach_listener(self, account_id: int, cli: TelegramClient):
-        previous = self._service_handlers.pop(account_id, None)
-        if previous:
-            old_cli, old_handler = previous
-            self._safe_remove_event_handler(
-                old_cli,
-                old_handler,
-                context=f"replace_listener:{account_id}",
-            )
-
-        async def _handler(event):
-            try:
-                text = event.message.message or ""
-                msg_id = event.message.id
-                m_type = classify_777000(text)
-                if m_type == "login_code":
-                    text = redact_login_code(text)
-                async with AsyncSessionLocal() as db:
-                    sm = SecurityMessage(
-                        account_id=account_id,
-                        tg_msg_id=msg_id,
-                        message_text=text,
-                        type=m_type,
-                        is_read=False,
-                        received_at=utc_now_naive(),
-                    )
-                    db.add(sm)
-                    try:
-                        await db.commit()
-                    except IntegrityError:
-                        await db.rollback()
-                        return
-                    await db.refresh(sm)
-                # notify pub/sub
-                for cb in list(self._new_msg_callbacks):
-                    try:
-                        cb({
-                            "id": sm.id,
-                            "account_id": account_id,
-                            "type": m_type,
-                            "message_text": text,
-                            "received_at": sm.received_at.isoformat(),
-                        })
-                    except Exception as cb_exc:
-                        log.warning(
-                            "new-message subscriber failed account=%s callback=%s error=%s",
-                            account_id,
-                            getattr(cb, "__name__", type(cb).__name__),
-                            type(cb_exc).__name__,
-                        )
-            except Exception as exc:
-                log.warning(
-                    "777000 handler failed account=%s error_type=%s",
-                    account_id,
-                    type(exc).__name__,
-                )
-        cli.add_event_handler(_handler, events.NewMessage(from_users=SERVICE_ID))
-        self._service_handlers[account_id] = (cli, _handler)
+        return self._security_messages.attach(account_id, cli)
 
     def subscribe_new_messages(self, cb):
-        self._new_msg_callbacks.append(cb)
+        return self._security_messages.subscribe(cb)
 
     def unsubscribe_new_messages(self, cb):
-        try:
-            self._new_msg_callbacks.remove(cb)
-        except ValueError:
-            pass
+        return self._security_messages.unsubscribe(cb)
 
     # ---------- DB helpers ----------
     async def _set_status(self, account_id: int, status: str):
@@ -1291,64 +1213,13 @@ class TgClientManager:
                 )
             await db.commit()
 
-    async def _backfill_777000(self, account_id: int, cli: TelegramClient, limit: int = 50):
-        """Read recent messages from 777000 and persist any we don't yet have.
-        Marks them as already-read so the user isn't flooded with old alerts."""
-        async with AsyncSessionLocal() as db:
-            res = await db.execute(
-                select(SecurityMessage.tg_msg_id).where(SecurityMessage.account_id == account_id)
-            )
-            seen = {row[0] for row in res.all()}
-        added = 0
-        try:
-            iterator = cli.iter_messages(SERVICE_ID, limit=limit).__aiter__()
-        except (RPCError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
-            log.warning(
-                "backfill Telegram stream unavailable account=%s error_type=%s",
-                account_id,
-                type(exc).__name__,
-            )
-            return
-
-        while True:
-            try:
-                msg = await iterator.__anext__()
-            except StopAsyncIteration:
-                break
-            except (RPCError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
-                log.warning(
-                    "backfill Telegram read stopped account=%s error_type=%s",
-                    account_id,
-                    type(exc).__name__,
-                )
-                break
-
-            if msg.id in seen:
-                continue
-            text = msg.message or ""
-            if not text:
-                continue
-            m_type = classify_777000(text)
-            if m_type == "login_code":
-                text = redact_login_code(text)
-            async with AsyncSessionLocal() as db:
-                sm = SecurityMessage(
-                    account_id=account_id,
-                    tg_msg_id=msg.id,
-                    message_text=text,
-                    type=m_type,
-                    is_read=True,  # backfilled history: don't spam unread
-                    received_at=msg.date.replace(tzinfo=None) if msg.date else utc_now_naive(),
-                )
-                db.add(sm)
-                try:
-                    await db.commit()
-                except IntegrityError:
-                    await db.rollback()
-                    continue
-            added += 1
-        if added:
-            log.info("backfilled %d 777000 messages for account %s", added, account_id)
+    async def _backfill_777000(
+        self,
+        account_id: int,
+        cli: TelegramClient,
+        limit: int = 50,
+    ):
+        return await self._security_messages.backfill(account_id, cli, limit)
 
     async def refresh_status_all(self):
         """Lightweight pass: check TCP/session connection state and schedule

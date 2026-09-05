@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from sqlalchemy.exc import IntegrityError
 
-from app import tg_manager
+from app import security_messages, tg_manager
 
 
 class _ExpectedRpcError(Exception):
@@ -84,8 +84,8 @@ class SecurityBackfillBoundaryTests(unittest.IsolatedAsyncioTestCase):
         client = _Client(_AsyncIterator(terminal_error=_ExpectedRpcError("sensitive-marker")))
 
         with (
-            patch.object(tg_manager, "RPCError", _ExpectedRpcError),
-            patch.object(tg_manager, "AsyncSessionLocal", _SessionFactory(initial_db)),
+            patch.object(security_messages, "RPCError", _ExpectedRpcError),
+            patch.object(security_messages, "AsyncSessionLocal", _SessionFactory(initial_db)),
             self.assertLogs("tg_manager", level="WARNING") as captured,
         ):
             await tg_manager.manager._backfill_777000(7, client, limit=10)
@@ -100,7 +100,7 @@ class SecurityBackfillBoundaryTests(unittest.IsolatedAsyncioTestCase):
         client = _Client(_AsyncIterator(terminal_error=RuntimeError("programming bug")))
 
         with patch.object(
-            tg_manager,
+            security_messages,
             "AsyncSessionLocal",
             _SessionFactory(initial_db),
         ):
@@ -113,7 +113,7 @@ class SecurityBackfillBoundaryTests(unittest.IsolatedAsyncioTestCase):
         client = _Client(_AsyncIterator([_message()]))
 
         with patch.object(
-            tg_manager,
+            security_messages,
             "AsyncSessionLocal",
             _SessionFactory(initial_db, write_db),
         ):
@@ -129,7 +129,7 @@ class SecurityBackfillBoundaryTests(unittest.IsolatedAsyncioTestCase):
         client = _Client(_AsyncIterator([_message()]))
 
         with patch.object(
-            tg_manager,
+            security_messages,
             "AsyncSessionLocal",
             _SessionFactory(initial_db, write_db),
         ):
@@ -140,18 +140,33 @@ class SecurityBackfillBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
 class SecurityBackfillSourceGuardTests(unittest.TestCase):
     def test_backfill_does_not_catch_broad_exception(self):
-        source_path = Path(__file__).resolve().parents[1] / "app" / "tg_manager.py"
+        source_path = Path(__file__).resolve().parents[1] / "app" / "security_messages.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
         offenders = []
+        found = False
         for node in ast.walk(tree):
-            if not isinstance(node, ast.AsyncFunctionDef) or node.name != "_backfill_777000":
+            if not isinstance(node, ast.AsyncFunctionDef) or node.name != "backfill":
                 continue
+            found = True
             for child in ast.walk(node):
                 if not isinstance(child, ast.ExceptHandler) or child.type is None:
                     continue
                 if isinstance(child.type, ast.Name) and child.type.id == "Exception":
                     offenders.append(getattr(child, "lineno", -1))
+        self.assertTrue(found, "SecurityMessageService.backfill missing")
         self.assertEqual(offenders, [], f"broad backfill exception handlers: {offenders}")
+
+    def test_tg_manager_keeps_only_security_message_compatibility_wrappers(self):
+        app_root = Path(__file__).resolve().parents[1] / "app"
+        manager_source = (app_root / "tg_manager.py").read_text(encoding="utf-8")
+        service_source = (app_root / "security_messages.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("SecurityMessage(", manager_source)
+        self.assertNotIn("events.NewMessage", manager_source)
+        self.assertIn("SecurityMessage(", service_source)
+        self.assertIn("events.NewMessage", service_source)
+        self.assertIn("self._security_messages.backfill", manager_source)
+        self.assertIn("self._security_messages.attach", manager_source)
 
 
 if __name__ == "__main__":
