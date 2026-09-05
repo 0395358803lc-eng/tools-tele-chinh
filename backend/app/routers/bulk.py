@@ -5,7 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
 from telethon.tl.functions.photos import UploadProfilePhotoRequest
 from telethon.errors import UsernameNotModifiedError
-import tempfile, os
+import logging
+import os
+import tempfile
 
 from ..db import get_db, AsyncSessionLocal
 from ..models import Account
@@ -15,6 +17,21 @@ from ..utils import bulk_stream, ok_result, skipped_result
 from ..uploads import ensure_image_upload, read_limited, sanitize_filename, validate_image_bytes, IMAGE_MAX_BYTES
 
 router = APIRouter(prefix="/api/bulk", tags=["bulk"])
+log = logging.getLogger("bulk")
+
+
+def _cleanup_temp_file(path: str) -> None:
+    """Best-effort cleanup for files created by bulk photo uploads."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log.warning(
+            "bulk photo temp cleanup failed file=%s error_type=%s",
+            os.path.basename(path),
+            type(exc).__name__,
+        )
 
 
 @router.post("/profile")
@@ -141,8 +158,7 @@ async def bulk_photo(
                 tmp.write(data); tmp_paths.append(tmp.name)
     except Exception:
         for p in tmp_paths:
-            try: os.unlink(p)
-            except Exception: pass
+            _cleanup_temp_file(p)
         raise
 
     path_by_id: dict[int, str | None] = {}
@@ -168,7 +184,6 @@ async def bulk_photo(
                 yield line
         finally:
             for p in tmp_paths:
-                try: os.unlink(p)
-                except Exception: pass
+                _cleanup_temp_file(p)
 
     return StreamingResponse(_gen(), media_type="application/x-ndjson")
