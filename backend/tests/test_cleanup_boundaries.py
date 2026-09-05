@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.tg_manager import TgClientManager
-from app.routers import bulk
+from app.routers import bulk, profile
 
 
 class _FakeClient:
@@ -96,6 +96,25 @@ class CleanupBoundaryTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ProfileTempCleanupTests(unittest.TestCase):
+    def test_expected_os_cleanup_failure_is_logged_and_contained(self):
+        with patch("app.routers.profile.os.unlink", side_effect=PermissionError("locked")):
+            with self.assertLogs("profile", level="WARNING") as captured:
+                profile._cleanup_temp_file(r"C:\\Temp\\profile-123.jpg")
+        self.assertTrue(
+            any("profile photo temp cleanup failed" in line for line in captured.output)
+        )
+
+    def test_missing_temp_file_is_already_clean(self):
+        with patch("app.routers.profile.os.unlink", side_effect=FileNotFoundError()):
+            profile._cleanup_temp_file(r"C:\\Temp\\already-gone.jpg")
+
+    def test_unexpected_cleanup_programming_error_is_not_swallowed(self):
+        with patch("app.routers.profile.os.unlink", side_effect=RuntimeError("bug")):
+            with self.assertRaises(RuntimeError):
+                profile._cleanup_temp_file(r"C:\\Temp\\profile-123.jpg")
+
+
 class BulkTempCleanupTests(unittest.TestCase):
     def test_expected_os_cleanup_failure_is_logged_and_contained(self):
         with patch("app.routers.bulk.os.unlink", side_effect=PermissionError("locked")):
@@ -116,6 +135,27 @@ class BulkTempCleanupTests(unittest.TestCase):
 
 
 class CleanupSourceGuardTests(unittest.TestCase):
+    def test_profile_and_backup_have_no_silent_broad_exception_pass(self):
+        source_paths = [
+            Path(__file__).resolve().parents[1] / "app" / "routers" / "profile.py",
+            Path(__file__).resolve().parents[1] / "app" / "backup_service.py",
+        ]
+        offenders = []
+        for source_path in source_paths:
+            tree = ast.parse(source_path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ExceptHandler) or node.type is None:
+                    continue
+                catches_exception = isinstance(node.type, ast.Name) and node.type.id == "Exception"
+                if isinstance(node.type, ast.Tuple):
+                    catches_exception = any(
+                        isinstance(item, ast.Name) and item.id == "Exception"
+                        for item in node.type.elts
+                    )
+                if catches_exception and len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
+                    offenders.append((source_path.name, getattr(node, "lineno", -1)))
+        self.assertEqual(offenders, [], f"silent broad exception handlers: {offenders}")
+
     def test_bulk_router_has_no_silent_broad_exception_pass(self):
         source_path = Path(__file__).resolve().parents[1] / "app" / "routers" / "bulk.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
