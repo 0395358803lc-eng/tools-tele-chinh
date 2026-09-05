@@ -156,7 +156,7 @@ class BackupAndSettingsTests(unittest.TestCase):
             bad = root / "2026-09-05_000000_000001"
             bad.mkdir()
             (bad / "manifest.json").write_text("{not-json", encoding="utf-8")
-            with patch("app.backup_service.settings.backups_path", root):
+            with patch("app.config.BACKUPS_DIR", root):
                 with self.assertLogs("backup_service", level="WARNING") as captured:
                     result = list_backups()
             self.assertEqual(result, [])
