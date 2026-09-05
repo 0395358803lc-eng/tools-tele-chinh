@@ -10,9 +10,6 @@ from typing import Awaitable, Callable, Optional, TypeVar
 
 from telethon import TelegramClient
 from telethon.errors import (
-    AuthKeyUnregisteredError,
-    UserDeactivatedBanError,
-    UserDeactivatedError,
     SessionPasswordNeededError,
     RPCError,
 )
@@ -23,6 +20,7 @@ from sqlalchemy import select
 
 from .config import settings
 from .account_scheduler import AccountActionScheduler
+from .account_health import AccountHealthService
 from .client_cleanup import TelegramClientCleanup
 from .session_files import SessionFileStore
 from .session_folder_sync import SessionFolderSyncService
@@ -33,7 +31,6 @@ from .models import Account, AppSetting, GoneAccount
 from . import secrets_store
 from .time_utils import utc_now_naive
 from .tg_utils import (
-    RECONNECT_BACKOFF_SECONDS,
     classify_777000,  # compatibility re-export for existing callers/tests
     permanent_connection_status,
     redact_login_code,
@@ -124,6 +121,25 @@ class TgClientManager:
         self._background_tasks: set[asyncio.Task] = set()
         self._last_auth_check: dict[int, float] = {}
         self._auth_cursor: int = 0
+        self._account_health = AccountHealthService(
+            clients=self._clients,
+            reconnect_attempts=self._reconnect_attempts,
+            reconnect_at=self._reconnect_at,
+            reconnect_exhausted=self._reconnect_exhausted,
+            manual_disconnect=self._manual_disconnect,
+            last_auth_check=self._last_auth_check,
+            get_auth_cursor=lambda: self._auth_cursor,
+            set_auth_cursor=lambda value: setattr(self, "_auth_cursor", value),
+            auto_reconnect_enabled=lambda: self.auto_reconnect,
+            set_status=lambda account_id, status: self._set_status(account_id, status),
+            mark_banned=lambda account_id: self._mark_banned(account_id),
+            start_client=lambda acc, reset_reconnect=False: self.start_client(
+                acc,
+                reset_reconnect=reset_reconnect,
+            ),
+            stop_client=lambda account_id: self.stop_client(account_id),
+            logger=log,
+        )
 
     def set_loop(self, loop):
         self._loop = loop
@@ -469,36 +485,12 @@ class TgClientManager:
         return permanent_connection_status(exc)
 
     def _reset_reconnect(self, account_id: int):
-        self._reconnect_attempts.pop(account_id, None)
-        self._reconnect_at.pop(account_id, None)
-        self._reconnect_exhausted.discard(account_id)
+        return self._account_health.reset_reconnect(account_id)
 
     async def _record_connection_failure(self, account_id: int, exc: Exception):
-        permanent = self._permanent_status(exc)
-        if permanent:
-            self._reconnect_exhausted.add(account_id)
-            self._reconnect_at.pop(account_id, None)
-            if permanent == "banned":
-                await self._mark_banned(account_id)
-            else:
-                await self._set_status(account_id, permanent)
-            return
-
-        attempts = self._reconnect_attempts.get(account_id, 0) + 1
-        self._reconnect_attempts[account_id] = attempts
-        await self._set_status(account_id, "disconnected")
-        if attempts > len(RECONNECT_BACKOFF_SECONDS):
-            self._reconnect_exhausted.add(account_id)
-            self._reconnect_at.pop(account_id, None)
-            log.warning("account=%s reconnect exhausted after %s attempts", account_id, attempts)
-            return
-        delay = RECONNECT_BACKOFF_SECONDS[attempts - 1]
-        self._reconnect_at[account_id] = time.monotonic() + delay
-        log.warning(
-            "account=%s reconnect attempt=%s failed; retry_in_seconds=%s",
+        return await self._account_health.record_connection_failure(
             account_id,
-            attempts,
-            delay,
+            exc,
         )
 
     async def start_client(self, acc: Account, *, reset_reconnect: bool = True) -> TelegramClient:
@@ -1023,155 +1015,12 @@ class TgClientManager:
         return await self._security_messages.backfill(account_id, cli, limit)
 
     async def refresh_status_all(self):
-        """Lightweight pass: check TCP/session connection state and schedule
-        reconnects. The expensive per-account ``is_user_authorized()`` call is
-        spread out in `verify_authorizations_all()` so it is never done for every
-        account on every 5s tick — that would burst auth RPCs as the fleet grows.
-        """
-        async with AsyncSessionLocal() as db:
-            res = await db.execute(select(Account))
-            accounts = list(res.scalars().all())
-        by_id = {acc.id: acc for acc in accounts}
-
-        # Cheap per-tick check: is the socket layer still connected?
-        for aid, cli in list(self._clients.items()):
-            try:
-                if not cli.is_connected():
-                    await self._set_status(aid, "disconnected")
-            except (OSError, RuntimeError) as exc:
-                log.debug(
-                    "account=%s connection-state probe failed error=%s",
-                    aid,
-                    type(exc).__name__,
-                )
-                await self._set_status(aid, "disconnected")
-                if self._permanent_status(exc):
-                    await self._record_connection_failure(aid, exc)
-
-        if not self.auto_reconnect:
-            return
-
-        now = time.monotonic()
-        due: list[tuple[int, Account]] = []
-        for aid, acc in by_id.items():
-            cli = self._clients.get(aid)
-            if cli and cli.is_connected():
-                continue
-            if acc.status in {"banned", "session_revoked", "auth_error"}:
-                continue
-            if aid in self._reconnect_exhausted:
-                continue
-            if aid in self._manual_disconnect:
-                continue
-            retry_at = self._reconnect_at.get(aid)
-            if retry_at is None:
-                # A detected disconnect waits 5s before reconnect attempt #1.
-                self._reconnect_attempts.setdefault(aid, 1)
-                self._reconnect_at[aid] = now + RECONNECT_BACKOFF_SECONDS[0]
-                continue
-            if retry_at > now:
-                continue
-            due.append((aid, acc))
-
-        async def _reconnect_one(aid: int, acc: Account):
-            await self._set_status(aid, "connecting")
-            try:
-                await asyncio.wait_for(
-                    self.start_client(acc, reset_reconnect=False), timeout=75
-                )
-                # A successful reconnect re-arms the auth-verify throttle.
-                self._last_auth_check[aid] = time.monotonic()
-            except Exception as exc:
-                log.warning(
-                    "account=%s reconnect failed error=%s",
-                    aid,
-                    type(exc).__name__,
-                )
-        if due:
-            await asyncio.gather(*(_reconnect_one(aid, acc) for aid, acc in due))
+        return await self._account_health.refresh_status_all()
 
     async def verify_authorizations_all(self) -> int:
-        """Expensive verification (`is_user_authorized()`) for connected clients,
-        throttled per account to at most once per STATUS_AUTH_INTERVAL and
-        staggered across ticks so a large fleet never bursts auth RPCs at once.
-
-        A rotating cursor spreads the work: each tick verifies only a slice of
-        the connected fleet (interval/poll fraction), so a full pass takes about
-        STATUS_AUTH_INTERVAL and each account is verified roughly every interval.
-        Returns how many accounts were verified this tick.
-        """
-        interval = max(30.0, float(getattr(settings, "STATUS_AUTH_INTERVAL", 60.0)))
-        poll = max(0.1, float(getattr(settings, "STATUS_POLL_SECS", 5.0)))
-        now = time.monotonic()
-
-        connected_ids: list[int] = []
-        for aid, cli in list(self._clients.items()):
-            try:
-                ok = cli.is_connected()
-            except (OSError, RuntimeError) as exc:
-                log.debug(
-                    "account=%s connection-state read failed error=%s",
-                    aid,
-                    type(exc).__name__,
-                )
-                ok = False
-            if ok:
-                connected_ids.append(aid)
-            else:
-                # Auth can't be verified on a dead socket; re-arm so a freshly
-                # reconnected account is verified promptly on the next slice.
-                self._last_auth_check.pop(aid, None)
-
-        if not connected_ids:
-            return 0
-
-        slice_n = max(1, int(round(interval / poll)))
-        cursor = self._auth_cursor
-        self._auth_cursor = (cursor + 1) % max(slice_n, 1)
-        batch = [aid for aid in connected_ids[cursor::slice_n]
-                 if (now - self._last_auth_check.get(aid, 0.0)) >= interval]
-
-        verified = 0
-        for aid in batch:
-            cli = self._clients.get(aid)
-            if not cli:
-                continue
-            try:
-                ok = await asyncio.wait_for(
-                    cli.is_user_authorized(), timeout=float(settings.TELEGRAM_AUTH_TIMEOUT)
-                )
-            except (UserDeactivatedBanError, UserDeactivatedError):
-                await self._mark_banned(aid)
-                self._reconnect_exhausted.add(aid)
-                await self.stop_client(aid)
-                self._last_auth_check[aid] = now
-                continue
-            except AuthKeyUnregisteredError:
-                await self._set_status(aid, "session_revoked")
-                self._reconnect_exhausted.add(aid)
-                await self.stop_client(aid)
-                self._last_auth_check[aid] = now
-                continue
-            except (RPCError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
-                # Transient Telegram/network failure — try again on a later slice.
-                log.debug(
-                    "account=%s authorization verify deferred error=%s",
-                    aid,
-                    type(exc).__name__,
-                )
-                continue
-
-            self._last_auth_check[aid] = now
-            if ok:
-                await self._set_status(aid, "connected")
-                self._reset_reconnect(aid)
-            else:
-                await self._set_status(aid, "session_revoked")
-                self._reconnect_exhausted.add(aid)
-                await self.stop_client(aid)
-            verified += 1
-
-        return verified
+        return await self._account_health.verify_authorizations_all(
+            reset_reconnect=self._reset_reconnect,
+        )
 
 
 manager = TgClientManager()
