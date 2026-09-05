@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import re
 from urllib.parse import urlparse, parse_qs
 
@@ -12,7 +13,7 @@ from telethon.tl.functions.messages import (
     StartBotRequest,
 )
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.types import (
     ReactionEmoji, ReactionCustomEmoji,
     ChatReactionsAll, ChatReactionsSome, ChatReactionsNone,
@@ -33,6 +34,7 @@ from ..utils import friendly_error, bulk_stream, ok_result, skipped_result
 from ..config import settings
 
 router = APIRouter(prefix="/api/messaging", tags=["messaging"])
+log = logging.getLogger("messaging")
 
 
 def _reaction_obj(emoji: str | None, custom_emoji_id: int | None):
@@ -107,7 +109,7 @@ async def bulk_send(body: BulkMessageIn, db: AsyncSession = Depends(get_db)):
 async def react(body: ReactIn, db: AsyncSession = Depends(get_db)):
     try:
         chan, msg_id = _parse_post_link(body.post_link)
-    except Exception:
+    except ValueError:
         raise HTTPException(400, "Invalid Telegram target or link")
 
     # Flatten assignments into a per-account reaction map (later assignment wins
@@ -141,7 +143,7 @@ async def allowed_reactions(body: AllowedReactionsIn, db: AsyncSession = Depends
     ones simply aren't offered)."""
     try:
         chan, _msg_id = _parse_post_link(body.post_link)
-    except Exception:
+    except ValueError:
         raise HTTPException(400, "Invalid Telegram target or link")
 
     # pick a client to query through
@@ -158,7 +160,13 @@ async def allowed_reactions(body: AllowedReactionsIn, db: AsyncSession = Depends
         try:
             full = await cli(GetFullChannelRequest(entity))
             avail = getattr(full.full_chat, "available_reactions", None)
-        except Exception:
+        except FloodWaitError:
+            raise
+        except RPCError as exc:
+            log.info(
+                "chat reaction policy unavailable error_type=%s",
+                type(exc).__name__,
+            )
             avail = None
 
         if isinstance(avail, ChatReactionsNone):
@@ -196,7 +204,13 @@ async def _global_standard_reactions(cli) -> list[str]:
             if emo:
                 out.append(emo)
         return out
-    except Exception:
+    except FloodWaitError:
+        raise
+    except RPCError as exc:
+        log.info(
+            "global reactions unavailable error_type=%s",
+            type(exc).__name__,
+        )
         return []
 
 
@@ -213,8 +227,15 @@ async def _resolve_custom(cli, ids: list[int]) -> list[AllowedCustomReaction]:
                     alt = attr.alt or ""
                     break
             out.append(AllowedCustomReaction(id=d.id, alt=alt))
-    except Exception:
-        # if we can't resolve alts, still return ids with a generic glyph
+    except FloodWaitError:
+        raise
+    except RPCError as exc:
+        # If Telegram can't resolve alts, keep the custom IDs usable with a
+        # generic glyph; unexpected runtime/programming errors still propagate.
+        log.info(
+            "custom reaction metadata unavailable error_type=%s",
+            type(exc).__name__,
+        )
         out = [AllowedCustomReaction(id=i, alt="⭐") for i in ids]
     return out
 
@@ -223,7 +244,7 @@ async def _resolve_custom(cli, ids: list[int]) -> list[AllowedCustomReaction]:
 async def view(body: ViewPostIn, db: AsyncSession = Depends(get_db)):
     try:
         chan, msg_id = _parse_post_link(body.post_link)
-    except Exception:
+    except ValueError:
         raise HTTPException(400, "Invalid Telegram target or link")
     accounts = await _accounts_named(db, body.account_ids)
 
@@ -512,9 +533,13 @@ async def open_chat(account_id: int, body: OpenChatIn):
                 )
             except FloodWaitError:
                 raise
-            except Exception:
-                # Fall back to a plain "/start <payload>" — the same payload still
-                # reaches the bot (e.g. if StartBot is rejected for an already-started bot).
+            except RPCError as exc:
+                # Fall back only when Telegram rejects StartBot. Unexpected
+                # runtime/programming errors must not trigger a second mutation.
+                log.info(
+                    "StartBot rejected; using message fallback error_type=%s",
+                    type(exc).__name__,
+                )
                 await manager.run_account_action(
                     account_id,
                     lambda: cli.send_message(entity, f"/start {start_param}"),
@@ -586,8 +611,14 @@ async def _wipe_chat_for_client(cli, target: str) -> tuple[str, str]:
         async for _m in cli.iter_messages(entity, limit=1):
             had = True
             break
-    except Exception:
-        had = None  # couldn't read — don't claim anything either way
+    except FloodWaitError:
+        raise
+    except RPCError as exc:
+        log.info(
+            "chat wipe existence probe unavailable error_type=%s",
+            type(exc).__name__,
+        )
+        had = None  # Telegram couldn't answer — don't claim anything either way
 
     await cli.delete_dialog(entity, revoke=True)
 
