@@ -97,18 +97,7 @@ def main() -> int:
         _write_smoke_env()
         with log_path.open("w", encoding="utf-8") as log_handle:
             proc = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "uvicorn",
-                    "app.main:app",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    "8000",
-                    "--log-level",
-                    "info",
-                ],
+                [sys.executable, "run_server.py"],
                 cwd=BACKEND_ROOT,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
