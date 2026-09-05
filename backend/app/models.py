@@ -1,4 +1,6 @@
 from datetime import datetime
+
+from .time_utils import utc_now_naive
 from sqlalchemy import String, Integer, DateTime, Boolean, Text, ForeignKey, Float, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
@@ -18,7 +20,7 @@ class Account(Base):
     has_2fa: Mapped[bool] = mapped_column(Boolean, default=False)
     is_online: Mapped[bool] = mapped_column(Boolean, default=False)
     last_seen: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
 
     messages: Mapped[list["SecurityMessage"]] = relationship(back_populates="account", cascade="all,delete-orphan")
 
@@ -34,7 +36,7 @@ class SecurityMessage(Base):
     message_text: Mapped[str] = mapped_column(Text)
     type: Mapped[str] = mapped_column(String(32), default="unknown")
     is_read: Mapped[bool] = mapped_column(Boolean, default=False)
-    received_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
 
     account: Mapped["Account"] = relationship(back_populates="messages")
 
@@ -55,7 +57,7 @@ class GoneAccount(Base):
     username: Mapped[str] = mapped_column(String(64), default="")
     old_serial: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reason: Mapped[str] = mapped_column(String(16), default="removed")  # banned/removed
-    gone_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    gone_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
 
 
 class AppSetting(Base):
@@ -69,4 +71,4 @@ class PendingLogin(Base):
     __tablename__ = "pending_logins"
     phone: Mapped[str] = mapped_column(String(32), primary_key=True)
     phone_code_hash: Mapped[str] = mapped_column(String(64))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
