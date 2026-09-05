@@ -103,7 +103,7 @@ class BackgroundDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         manager = TgClientManager()
         with (
             patch("app.security_messages.RPCError", _ExpectedRpcError),
-            patch("app.tg_manager.AsyncSessionLocal", return_value=_ReadSession()),
+            patch("app.security_messages.AsyncSessionLocal", return_value=_ReadSession()),
             self.assertLogs("tg_manager", level="WARNING") as captured,
         ):
             await manager._backfill_777000(
