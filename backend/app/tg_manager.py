@@ -5,7 +5,6 @@ from contextlib import suppress
 import logging
 import secrets
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
 
@@ -30,6 +29,7 @@ from .session_files import SessionFileStore
 from .db import AsyncSessionLocal
 from .models import Account, AppSetting, SecurityMessage, GoneAccount
 from . import secrets_store
+from .time_utils import utc_now_naive
 from .tg_utils import (
     RECONNECT_BACKOFF_SECONDS,
     classify_777000,
@@ -65,7 +65,7 @@ async def record_gone_account(db, acc: Account, reason: str):
         username=acc.username or "",
         old_serial=serial,
         reason=reason,
-        gone_at=datetime.utcnow(),
+        gone_at=utc_now_naive(),
     ))
 
 
@@ -1202,7 +1202,7 @@ class TgClientManager:
                         message_text=text,
                         type=m_type,
                         is_read=False,
-                        received_at=datetime.utcnow(),
+                        received_at=utc_now_naive(),
                     )
                     db.add(sm)
                     try:
@@ -1338,7 +1338,7 @@ class TgClientManager:
                     message_text=text,
                     type=m_type,
                     is_read=True,  # backfilled history: don't spam unread
-                    received_at=msg.date.replace(tzinfo=None) if msg.date else datetime.utcnow(),
+                    received_at=msg.date.replace(tzinfo=None) if msg.date else utc_now_naive(),
                 )
                 db.add(sm)
                 try:
