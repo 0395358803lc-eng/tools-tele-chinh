@@ -3,16 +3,12 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import logging
-import secrets
 import time
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
 
 from telethon import TelegramClient
-from telethon.errors import (
-    SessionPasswordNeededError,
-    RPCError,
-)
+from telethon.errors import RPCError
 from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
 from telethon.tl.functions.photos import UploadProfilePhotoRequest
 from telethon.tl.types import User as TgUser
