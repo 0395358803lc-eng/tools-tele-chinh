@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import shutil
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
 from .config import settings
+
+log = logging.getLogger("backup_service")
+_EXPECTED_SQLITE_BACKUP_ERRORS = (sqlite3.Error, OSError, RuntimeError)
 
 
 def _sha256(path: Path) -> str:
@@ -50,12 +54,21 @@ def _best_effort_backup(source_path: Path, destination_path: Path) -> tuple[bool
     try:
         _sqlite_backup(source_path, destination_path)
         return True, False
-    except Exception:
-        pass
+    except _EXPECTED_SQLITE_BACKUP_ERRORS as exc:
+        log.warning(
+            "verified SQLite backup failed source=%s error_type=%s; trying raw copy",
+            source_path.name,
+            type(exc).__name__,
+        )
     try:
         _raw_copy(source_path, destination_path)
         return True, True
-    except Exception:
+    except OSError as exc:
+        log.warning(
+            "raw backup copy failed source=%s error_type=%s",
+            source_path.name,
+            type(exc).__name__,
+        )
         return False, False
 
 
@@ -98,8 +111,13 @@ def _create_backup_sync(
     for session in sessions_path.glob("*.session"):
         try:
             _sqlite_backup(session, session_target / session.name)
-        except Exception:
+        except _EXPECTED_SQLITE_BACKUP_ERRORS as exc:
             if best_effort:
+                log.warning(
+                    "verified session backup failed session=%s error_type=%s; trying raw copy",
+                    session.name,
+                    type(exc).__name__,
+                )
                 _raw_copy(session, session_target / session.name)
             else:
                 raise
@@ -161,7 +179,12 @@ def list_backups() -> list[dict]:
             continue
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            log.warning(
+                "backup manifest skipped backup=%s error_type=%s",
+                path.name,
+                type(exc).__name__,
+            )
             continue
         out.append({"name": path.name, **manifest})
     return out

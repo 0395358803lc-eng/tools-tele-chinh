@@ -10,7 +10,7 @@ from unittest.mock import patch
 from fastapi import HTTPException, UploadFile
 from PIL import Image
 
-from app.backup_service import _create_backup_sync, _sqlite_backup
+from app.backup_service import _best_effort_backup, _create_backup_sync, _sqlite_backup, list_backups
 from app.schemas import SettingsIn
 from app.tg_manager import redact_login_code
 from app.uploads import read_limited, sanitize_filename, validate_image_bytes
@@ -98,6 +98,71 @@ class BackupAndSettingsTests(unittest.TestCase):
             self.assertEqual((target / "secrets" / "twofa.bin").read_bytes(), b"encrypted")
             manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["sessions"], 1)
+
+    def test_best_effort_backup_falls_back_for_expected_sqlite_error(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.db"
+            destination = root / "backup.db"
+            source.write_bytes(b"raw-db")
+            with patch(
+                "app.backup_service._sqlite_backup",
+                side_effect=sqlite3.DatabaseError("corrupt"),
+            ):
+                with self.assertLogs("backup_service", level="WARNING") as captured:
+                    success, used_raw = _best_effort_backup(source, destination)
+            self.assertTrue(success)
+            self.assertTrue(used_raw)
+            self.assertEqual(destination.read_bytes(), b"raw-db")
+            self.assertTrue(
+                any("trying raw copy" in line for line in captured.output)
+            )
+
+    def test_best_effort_backup_does_not_swallow_programming_error(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.db"
+            destination = root / "backup.db"
+            source.write_bytes(b"data")
+            with patch(
+                "app.backup_service._sqlite_backup",
+                side_effect=ValueError("programming bug"),
+            ):
+                with self.assertRaises(ValueError):
+                    _best_effort_backup(source, destination)
+
+    def test_best_effort_raw_copy_does_not_swallow_programming_error(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.db"
+            destination = root / "backup.db"
+            source.write_bytes(b"data")
+            with (
+                patch(
+                    "app.backup_service._sqlite_backup",
+                    side_effect=sqlite3.DatabaseError("corrupt"),
+                ),
+                patch(
+                    "app.backup_service._raw_copy",
+                    side_effect=ValueError("programming bug"),
+                ),
+            ):
+                with self.assertRaises(ValueError):
+                    _best_effort_backup(source, destination)
+
+    def test_list_backups_skips_malformed_manifest_with_log(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            bad = root / "2026-09-05_000000_000001"
+            bad.mkdir()
+            (bad / "manifest.json").write_text("{not-json", encoding="utf-8")
+            with patch("app.config.BACKUPS_DIR", root):
+                with self.assertLogs("backup_service", level="WARNING") as captured:
+                    result = list_backups()
+            self.assertEqual(result, [])
+            self.assertTrue(
+                any("backup manifest skipped" in line for line in captured.output)
+            )
 
     def test_settings_reject_invalid_runtime_values(self):
         with self.assertRaises(Exception):

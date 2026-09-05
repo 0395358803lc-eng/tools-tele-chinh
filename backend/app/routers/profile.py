@@ -6,8 +6,9 @@ from telethon.tl.functions.account import (
 from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotosRequest, GetUserPhotosRequest
 from telethon.errors import UsernameOccupiedError, UsernameInvalidError, FloodWaitError
 import io
-import tempfile
+import logging
 import os
+import tempfile
 
 from ..db import get_db
 from ..models import Account
@@ -18,6 +19,20 @@ from ..utils import friendly_error
 from .accounts import _account_to_out
 
 router = APIRouter(prefix="/api/accounts/{account_id}/profile", tags=["profile"])
+log = logging.getLogger("profile")
+
+
+def _cleanup_temp_file(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log.warning(
+            "profile photo temp cleanup failed file=%s error_type=%s",
+            os.path.basename(path),
+            type(exc).__name__,
+        )
 
 
 def _client_or_404(account_id: int):
@@ -133,8 +148,7 @@ async def upload_photo(account_id: int, file: UploadFile = File(...), db: AsyncS
     except Exception as e:
         raise HTTPException(400, friendly_error(e))
     finally:
-        try: os.unlink(tmp_path)
-        except Exception: pass
+        _cleanup_temp_file(tmp_path)
     return await _account_to_out(acc, db)
 
 
