@@ -2,17 +2,20 @@ import unittest
 
 from fastapi.routing import APIRoute
 
-from app.auth import require_auth
+from app.auth import require_auth, router as auth_router
 from app.main import app
 
 
-PUBLIC_API_OPERATIONS = {
+AUTH_PUBLIC_OPERATIONS = {
     ("POST", "/api/auth-app/login"),
     ("POST", "/api/auth-app/logout"),
     ("GET", "/api/auth-app/me"),
+}
+APP_PUBLIC_OPERATIONS = {
     ("GET", "/api/health"),
     ("POST", "/api/app/shutdown"),
 }
+PUBLIC_API_OPERATIONS = AUTH_PUBLIC_OPERATIONS | APP_PUBLIC_OPERATIONS
 
 
 def _dependency_tree_contains(dependant, target) -> bool:
@@ -48,16 +51,19 @@ class ApiContractTests(unittest.TestCase):
                     seen[key] = route.name
         self.assertEqual(duplicates, [], f"duplicate API operations: {duplicates}")
 
-    def test_public_api_surface_is_explicit_and_small(self):
+    def test_auth_router_public_surface_is_exact(self):
         operations = {
             (method, route.path)
-            for route in self._all_api_routes()
-            if route.path != "/api/{rest:path}"
-            for method in (route.methods or set())
+            for route in auth_router.routes
+            for method in (getattr(route, "methods", None) or set())
         }
-        missing = PUBLIC_API_OPERATIONS - operations
-        self.assertEqual(missing, set(), f"expected public operations missing: {sorted(missing)}")
+        self.assertEqual(
+            operations,
+            AUTH_PUBLIC_OPERATIONS,
+            f"auth public surface changed: {sorted(operations)}",
+        )
 
+    def test_public_api_surface_is_explicit_and_small(self):
         accidental_public = []
         for route in self._all_api_routes():
             if route.path == "/api/{rest:path}":
