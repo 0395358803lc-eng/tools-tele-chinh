@@ -1,5 +1,6 @@
 import logging
 import re
+import sys
 from logging.handlers import RotatingFileHandler
 
 from .config import settings
@@ -30,6 +31,21 @@ class RedactingFormatter(logging.Formatter):
         return text
 
 
+def _safe_close_rotating_handler(handler: RotatingFileHandler, *, owner: str) -> bool:
+    """Close a rotating file handler without silently swallowing I/O failures."""
+    try:
+        handler.close()
+        return True
+    except (OSError, ValueError) as exc:
+        # Logging itself is being reconfigured here, so stderr is the safest
+        # diagnostic sink. Do not emit raw exception messages.
+        sys.stderr.write(
+            "logging handler close failed "
+            f"owner={owner} error_type={type(exc).__name__}\n"
+        )
+        return False
+
+
 def configure_logging(force: bool = False):
     root = logging.getLogger()
     if getattr(root, "_mtm_configured", False) and not force:
@@ -40,10 +56,7 @@ def configure_logging(force: bool = False):
         # Close and remove old file handlers to avoid duplicate writes / leaks
         for h in list(root.handlers):
             if isinstance(h, RotatingFileHandler):
-                try:
-                    h.close()
-                except Exception:
-                    pass
+                _safe_close_rotating_handler(h, owner="root")
         # We will rebuild below; keep the flag to allow rebuild
         root.handlers.clear()
         # also clear uvicorn logger handlers that dictConfig created
@@ -51,10 +64,7 @@ def configure_logging(force: bool = False):
             lg = logging.getLogger(_name)
             for h in list(lg.handlers):
                 if isinstance(h, RotatingFileHandler):
-                    try:
-                        h.close()
-                    except Exception:
-                        pass
+                    _safe_close_rotating_handler(h, owner=_name)
             lg.handlers.clear()
     else:
         if getattr(root, "_mtm_configured", False):
@@ -69,11 +79,10 @@ def configure_logging(force: bool = False):
     console = logging.StreamHandler()
     console.setFormatter(formatter)
     console.addFilter(redaction)
-    # Ensure log directory exists before handler creation
-    try:
-        settings.logs_path.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+    # Ensure log directory exists before handler creation. If this fails, let
+    # configuration fail loudly instead of hiding the root cause and failing
+    # later during RotatingFileHandler construction.
+    settings.logs_path.mkdir(parents=True, exist_ok=True)
     file_handler = RotatingFileHandler(
         settings.logs_path / "app.log",
         maxBytes=5 * 1024 * 1024,
