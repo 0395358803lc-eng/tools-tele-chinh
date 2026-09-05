@@ -4,7 +4,7 @@ from telethon.tl.functions.account import (
     UpdateProfileRequest, UpdateUsernameRequest, CheckUsernameRequest,
 )
 from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotosRequest, GetUserPhotosRequest
-from telethon.errors import UsernameOccupiedError, UsernameInvalidError, FloodWaitError
+from telethon.errors import UsernameOccupiedError, UsernameInvalidError, FloodWaitError, RPCError
 import io
 import logging
 import os
@@ -90,7 +90,13 @@ async def check_username(account_id: int, username: str):
         return UsernameCheckOut(available=False, reason="invalid")
     except UsernameOccupiedError:
         return UsernameCheckOut(available=False, reason="occupied")
-    except Exception:
+    except FloodWaitError as exc:
+        raise HTTPException(429, f"FloodWait: wait {exc.seconds}s")
+    except RPCError as exc:
+        log.info(
+            "username availability check failed error_type=%s",
+            type(exc).__name__,
+        )
         return UsernameCheckOut(available=False, reason="check_failed")
 
 
@@ -165,5 +171,11 @@ async def get_photo_url(account_id: int):
         import base64
         b64 = base64.b64encode(buf.getvalue()).decode()
         return {"data_url": f"data:image/jpeg;base64,{b64}"}
-    except Exception:
+    except FloodWaitError as exc:
+        raise HTTPException(429, f"FloodWait: wait {exc.seconds}s")
+    except RPCError as exc:
+        log.info(
+            "profile photo preview unavailable error_type=%s",
+            type(exc).__name__,
+        )
         return {"data_url": None}
