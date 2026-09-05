@@ -2,8 +2,8 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime
-from contextlib import suppress
 import asyncio
+import logging
 import tempfile
 from pathlib import Path
 
@@ -22,6 +22,80 @@ from ..uploads import sanitize_filename, read_limited, SESSION_MAX_BYTES
 from .. import secrets_store
 
 router = APIRouter(prefix="/api", tags=["accounts"])
+log = logging.getLogger("accounts")
+
+
+async def _rollback_account_persist(
+    db: AsyncSession,
+    *,
+    account_id: int | None,
+    existed: bool,
+    old_values: dict | None,
+    swap: dict,
+    was_running: bool,
+) -> None:
+    """Best-effort recovery after account/session promotion fails.
+
+    Every recovery step is isolated so one cleanup failure cannot prevent the
+    remaining DB/session/client restoration attempts. Raw exception messages are
+    intentionally not logged because account lifecycle errors may contain
+    sensitive Telegram/session details.
+    """
+    try:
+        await db.rollback()
+    except Exception as exc:
+        log.warning(
+            "account persist rollback failed step=db_rollback account_id=%s error_type=%s",
+            account_id,
+            type(exc).__name__,
+        )
+
+    if account_id is not None:
+        try:
+            current = await db.get(Account, account_id)
+            if existed and old_values:
+                if current:
+                    for name, value in old_values.items():
+                        setattr(current, name, value)
+            elif current:
+                await db.delete(current)
+            await db.commit()
+        except Exception as exc:
+            log.warning(
+                "account persist rollback failed step=db_restore account_id=%s error_type=%s",
+                account_id,
+                type(exc).__name__,
+            )
+            try:
+                await db.rollback()
+            except Exception as rollback_exc:
+                log.warning(
+                    "account persist rollback failed step=db_restore_rollback account_id=%s error_type=%s",
+                    account_id,
+                    type(rollback_exc).__name__,
+                )
+
+    try:
+        manager.rollback_session_swap(swap)
+    except Exception as exc:
+        log.warning(
+            "account persist rollback failed step=session_restore account_id=%s error_type=%s",
+            account_id,
+            type(exc).__name__,
+        )
+
+    if existed and was_running and account_id is not None:
+        try:
+            restored = await db.get(Account, account_id)
+            if restored:
+                await manager.start_client(restored)
+        except Exception as exc:
+            log.warning(
+                "account persist rollback failed step=client_restart account_id=%s error_type=%s",
+                account_id,
+                type(exc).__name__,
+            )
+
 
 
 async def _account_to_out(acc: Account, db: AsyncSession, unread: int | None = None) -> AccountOut:
@@ -267,26 +341,14 @@ async def _persist_account(db: AsyncSession, phone: str, me, source_base: str) -
         await db.refresh(acc)
         await manager.start_client(acc)
     except BaseException:
-        with suppress(Exception):
-            await db.rollback()
-        if acc and getattr(acc, "id", None):
-            with suppress(Exception):
-                if existed and old_values:
-                    current = await db.get(Account, acc.id)
-                    if current:
-                        for name, value in old_values.items():
-                            setattr(current, name, value)
-                else:
-                    current = await db.get(Account, acc.id)
-                    if current:
-                        await db.delete(current)
-                await db.commit()
-        manager.rollback_session_swap(swap)
-        if existed and was_running and acc:
-            with suppress(Exception):
-                restored = await db.get(Account, acc.id)
-                if restored:
-                    await manager.start_client(restored)
+        await _rollback_account_persist(
+            db,
+            account_id=getattr(acc, "id", None) if acc else None,
+            existed=existed,
+            old_values=old_values,
+            swap=swap,
+            was_running=was_running,
+        )
         raise
     manager.commit_session_swap(swap, old_bases)
     return acc
