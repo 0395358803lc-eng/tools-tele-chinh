@@ -3,16 +3,12 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import logging
-import secrets
 import time
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
 
 from telethon import TelegramClient
-from telethon.errors import (
-    SessionPasswordNeededError,
-    RPCError,
-)
+from telethon.errors import RPCError
 from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
 from telethon.tl.functions.photos import UploadProfilePhotoRequest
 from telethon.tl.types import User as TgUser
@@ -25,6 +21,7 @@ from .client_cleanup import TelegramClientCleanup
 from .session_files import SessionFileStore
 from .session_folder_sync import SessionFolderSyncService
 from .phone_login import PhoneLoginService
+from .qr_login import QRLoginService
 from .security_messages import SecurityMessageService, SERVICE_ID
 from .db import AsyncSessionLocal
 from .models import Account, AppSetting, GoneAccount
@@ -72,9 +69,6 @@ async def record_gone_account(db, acc: Account, reason: str):
 class TgClientManager:
     def __init__(self):
         self._clients: dict[int, TelegramClient] = {}  # account_id -> client
-        self._qr_pending: dict[str, dict] = {}  # qr_id -> {'client', 'qr_login', 'wait_task', 'needs_2fa', 'session_path'}
-        self._qr_locks: dict[str, asyncio.Lock] = {}
-        self._qr_completed: dict[str, tuple[float, dict]] = {}
         # Per-account locks so two calls can't start/stop the SAME account at
         # once, while DIFFERENT accounts still connect concurrently (a single
         # global lock would serialize all 100+ accounts on boot).
@@ -86,6 +80,21 @@ class TgClientManager:
         self._action_scheduler = AccountActionScheduler(log)
         self._cleanup = TelegramClientCleanup(log)
         self._session_files = SessionFileStore(log)
+        self._qr_login = QRLoginService(
+            client_factory=lambda *args, **kwargs: TelegramClient(*args, **kwargs),
+            safe_disconnect=lambda client, **kwargs: self._safe_disconnect(
+                client,
+                **kwargs,
+            ),
+            remove_session_files=lambda path: self._remove_session_files(path),
+            save_2fa=lambda phone, password: secrets_store.save_2fa(
+                phone,
+                password,
+            ),
+            cleanup_pending=lambda: self.cleanup_expired_pending(),
+            wait_for_scan=lambda qr_id: self._qr_wait(qr_id),
+            logger=log,
+        )
         self._phone_login = PhoneLoginService(
             normalize_phone=self.normalize_phone,
             temp_session_path=self._phone_temp_session_path,
@@ -107,6 +116,9 @@ class TgClientManager:
         # services own the actual collections.
         self._pending = self._phone_login.pending
         self._phone_locks = self._phone_login.locks
+        self._qr_pending = self._qr_login.pending
+        self._qr_locks = self._qr_login.locks
+        self._qr_completed = self._qr_login.completed
         self._service_handlers = self._security_messages.handlers
         self._new_msg_callbacks = self._security_messages.callbacks
         self.auto_reconnect = True
@@ -636,21 +648,8 @@ class TgClientManager:
             await self.cleanup_expired_pending()
 
     async def cleanup_expired_pending(self):
-        now = time.monotonic()
         await self._phone_login.cleanup_expired()
-        for qr_id, entry in list(self._qr_pending.items()):
-            if entry.get('expires_at', 0) <= now:
-                entry['error'] = entry.get('error') or "QR code expired"
-                await self._close_qr_entry(qr_id, remove=False)
-                # Keep a terminal status briefly for the poller, then evict it.
-                if entry.get('closed_at', now) + 30 <= now:
-                    self._qr_pending.pop(qr_id, None)
-                    self._qr_locks.pop(qr_id, None)
-        completed_ttl = max(30, int(settings.QR_PENDING_TTL_SECONDS))
-        for qr_id, (finished_at, _payload) in list(self._qr_completed.items()):
-            if finished_at + completed_ttl <= now:
-                self._qr_completed.pop(qr_id, None)
-                self._qr_locks.pop(qr_id, None)
+        await self._qr_login.cleanup_expired()
 
     async def send_code(self, phone: str) -> str:
         await self.cleanup_expired_pending()
@@ -700,253 +699,59 @@ class TgClientManager:
     # and mark the pending entry done/failed/needs_2fa accordingly.
 
     def _qr_session_path(self, qr_id: str) -> str:
-        return str(settings.sessions_path / f"qr_{qr_id}")
+        return self._qr_login.session_path(qr_id)
 
     async def qr_start(self) -> dict:
-        """Begin a new QR login. Returns {qr_id, url, expires_at}."""
-        if not settings.api_configured:
-            raise RuntimeError(
-                "TG_API_ID / TG_API_HASH are not set in backend/.env — cannot start QR login.\n"
-                "Get your credentials from https://my.telegram.org and fill them in."
-            )
-        qr_id = secrets.token_urlsafe(12)
-        sess_path = self._qr_session_path(qr_id)
-        cli = TelegramClient(sess_path, settings.tg_api_id, settings.TG_API_HASH)
-        keep = False
-        try:
-            await asyncio.wait_for(
-                cli.connect(), timeout=float(settings.TELEGRAM_CONNECT_TIMEOUT)
-            )
-            qr_login = await asyncio.wait_for(cli.qr_login(), timeout=30)
-            entry = {
-                'client': cli,
-                'qr_login': qr_login,
-                'wait_task': None,
-                'needs_2fa': False,
-                'authorized': False,
-                'error': None,
-                'me': None,
-                'session_path': sess_path,
-                'expires_at': time.monotonic() + max(30, int(settings.QR_PENDING_TTL_SECONDS)),
-                'closed_at': None,
-            }
-            self._qr_pending[qr_id] = entry
-            entry['wait_task'] = asyncio.create_task(self._qr_wait(qr_id))
-            keep = True
-        finally:
-            if not keep:
-                await self._safe_disconnect(
-                    cli,
-                    context=f"qr_start_cleanup:{qr_id}",
-                    suppress_cancelled=True,
-                )
-                self._remove_session_files(sess_path)
-        return {
-            'qr_id': qr_id,
-            'url': qr_login.url,
-            'expires_at': qr_login.expires.isoformat() if qr_login.expires else None,
-        }
+        return await self._qr_login.start()
 
     async def _qr_wait(self, qr_id: str):
-        """Background task that waits for QR scan -> auth completion."""
-        entry = self._qr_pending.get(qr_id)
-        if not entry:
-            return
-        cli: TelegramClient = entry['client']
-        qr = entry['qr_login']
-        try:
-            await qr.wait()
-            try:
-                me = await cli.get_me()
-                entry['me'] = me
-                entry['authorized'] = True
-            except Exception as exc:
-                log.warning(
-                    "QR login user lookup failed qr_id=%s error=%s",
-                    qr_id,
-                    type(exc).__name__,
-                )
-                entry['error'] = "Could not read Telegram user information"
-                await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
-        except SessionPasswordNeededError:
-            entry['needs_2fa'] = True
-        except asyncio.TimeoutError:
-            entry['error'] = "QR code expired"
-            await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.warning(
-                "QR login wait failed qr_id=%s error=%s",
-                qr_id,
-                type(exc).__name__,
-            )
-            entry['error'] = "QR login failed"
-            await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
+        return await self._qr_login.wait(qr_id)
 
     async def qr_recreate(self, qr_id: str) -> dict:
-        """Refresh the QR token within an existing pending entry (same client)."""
-        entry = self._qr_pending.get(qr_id)
-        if not entry:
-            raise RuntimeError("QR session not found")
-        await self.cleanup_expired_pending()
-        entry = self._qr_pending.get(qr_id)
-        if not entry:
-            raise RuntimeError("QR session not found")
-        # cancel the old wait task before issuing a new qr_login
-        old = entry.get('wait_task')
-        if old and not old.done():
-            old.cancel()
-            with suppress(asyncio.CancelledError):
-                await old
-        cli: TelegramClient = entry['client']
-        if entry.get('closed_at') is not None or not cli.is_connected():
-            await self._safe_disconnect(
-                cli,
-                context=f"qr_recreate_closed:{qr_id}",
-                suppress_cancelled=True,
-            )
-            self._remove_session_files(entry['session_path'])
-            cli = TelegramClient(
-                entry['session_path'], settings.tg_api_id, settings.TG_API_HASH
-            )
-            try:
-                await asyncio.wait_for(
-                    cli.connect(), timeout=float(settings.TELEGRAM_CONNECT_TIMEOUT)
-                )
-            except BaseException:
-                await self._safe_disconnect(
-                    cli,
-                    context=f"qr_recreate_connect_failed:{qr_id}",
-                    suppress_cancelled=True,
-                )
-                self._remove_session_files(entry['session_path'])
-                raise
-            entry['client'] = cli
-        try:
-            qr_login = await asyncio.wait_for(cli.qr_login(), timeout=30)
-        except BaseException:
-            entry['error'] = "QR login failed"
-            await self._close_qr_entry(qr_id, remove=False, cancel_wait=False)
-            raise
-        entry['qr_login'] = qr_login
-        entry['error'] = None
-        entry['authorized'] = False
-        entry['needs_2fa'] = False
-        entry['closed_at'] = None
-        entry['expires_at'] = time.monotonic() + max(30, int(settings.QR_PENDING_TTL_SECONDS))
-        entry['wait_task'] = asyncio.create_task(self._qr_wait(qr_id))
-        return {
-            'qr_id': qr_id,
-            'url': qr_login.url,
-            'expires_at': qr_login.expires.isoformat() if qr_login.expires else None,
-        }
+        return await self._qr_login.recreate(qr_id)
 
     async def qr_status(self, qr_id: str) -> dict:
-        completed = self._qr_completed.get(qr_id)
-        if completed:
-            return {'state': 'finalized', **completed[1]}
-        await self.cleanup_expired_pending()
-        entry = self._qr_pending.get(qr_id)
-        if not entry:
-            return {'state': 'missing'}
-        if entry['authorized']:
-            return {'state': 'authorized'}
-        if entry['needs_2fa']:
-            return {'state': 'needs_2fa'}
-        if entry['error'] == 'QR code expired':
-            return {'state': 'expired'}
-        if entry['error']:
-            return {'state': 'error', 'error': entry['error']}
-        return {'state': 'waiting'}
+        return await self._qr_login.status(qr_id)
 
     async def qr_finalize(self, qr_id: str):
-        """After authorized, return (me, session_path) so the caller can persist
-        the account and rename the session file to phone-keyed naming."""
-        entry = self._qr_pending.get(qr_id)
-        if not entry or not entry['authorized']:
-            raise RuntimeError("QR not authorized")
-        return entry['me'], entry['client'], entry['session_path']
+        return await self._qr_login.finalize(qr_id)
 
     def qr_finalize_lock(self, qr_id: str) -> asyncio.Lock:
-        return self._qr_locks.setdefault(qr_id, asyncio.Lock())
+        return self._qr_login.finalize_lock(qr_id)
 
     def qr_completed(self, qr_id: str) -> dict | None:
-        item = self._qr_completed.get(qr_id)
-        return item[1] if item else None
+        return self._qr_login.completed_payload(qr_id)
 
     def mark_qr_completed(self, qr_id: str, payload: dict):
-        self._qr_completed[qr_id] = (time.monotonic(), payload)
+        return self._qr_login.mark_completed(qr_id, payload)
 
     async def qr_submit_2fa(self, qr_id: str, password: str):
-        entry = self._qr_pending.get(qr_id)
-        if not entry:
-            raise RuntimeError("QR session not found")
-        if not entry['needs_2fa']:
-            raise RuntimeError("QR session does not require 2FA")
-        cli: TelegramClient = entry['client']
-        await asyncio.wait_for(cli.sign_in(password=password), timeout=30)
-        me = await cli.get_me()
-        entry['authorized'] = True
-        entry['me'] = me
-        # Remember this 2FA password locally (keyed by the account's phone).
-        try:
-            if getattr(me, "phone", None):
-                await secrets_store.save_2fa(me.phone, password)
-        except (OSError, RuntimeError, ValueError) as exc:
-            log.warning(
-                "qr secure 2FA password save failed error=%s",
-                type(exc).__name__,
-            )
-        return me
+        return await self._qr_login.submit_2fa(qr_id, password)
 
     async def qr_promote_to_phone(self, qr_id: str, phone: str):
-        """Move the QR-temp session file to the canonical acc_<phone>.session
-        path and disconnect the temp client. Returns the new path."""
-        entry = self._qr_pending.get(qr_id)
-        if not entry:
-            raise RuntimeError("QR session not found")
-        wait_task = entry.get('wait_task')
-        if wait_task and not wait_task.done():
-            wait_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await wait_task
-        await self._safe_disconnect(
-            entry.get('client'),
-            context=f"qr_promote:{qr_id}",
-            suppress_cancelled=True,
-        )
-        return entry['session_path']
+        return await self._qr_login.promote_to_phone(qr_id, phone)
 
     async def finish_qr(self, qr_id: str, *, remove_session: bool):
-        entry = self._qr_pending.pop(qr_id, None)
-        if entry and remove_session:
-            self._remove_session_files(entry.get('session_path', ''))
+        return await self._qr_login.finish(
+            qr_id,
+            remove_session=remove_session,
+        )
 
     async def _close_qr_entry(
-        self, qr_id: str, *, remove: bool, cancel_wait: bool = True
+        self,
+        qr_id: str,
+        *,
+        remove: bool,
+        cancel_wait: bool = True,
     ):
-        entry = self._qr_pending.get(qr_id)
-        if not entry:
-            return
-        wait_task = entry.get('wait_task')
-        current = asyncio.current_task()
-        if cancel_wait and wait_task and wait_task is not current and not wait_task.done():
-            wait_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await wait_task
-        await self._safe_disconnect(
-            entry.get('client'),
-            context=f"qr_close:{qr_id}",
-            suppress_cancelled=True,
+        return await self._qr_login.close_entry(
+            qr_id,
+            remove=remove,
+            cancel_wait=cancel_wait,
         )
-        self._remove_session_files(entry.get('session_path', ''))
-        entry['closed_at'] = entry.get('closed_at') or time.monotonic()
-        if remove:
-            self._qr_pending.pop(qr_id, None)
 
     async def qr_cancel(self, qr_id: str):
-        await self._close_qr_entry(qr_id, remove=True)
+        return await self._qr_login.cancel(qr_id)
 
     def _safe_unlink(self, path: str):
         self._session_files.safe_unlink(path)
