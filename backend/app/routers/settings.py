@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 import json
-from datetime import datetime
 from collections import deque
 import os
 import platform
@@ -15,6 +14,7 @@ from ..tg_manager import manager
 from ..backup_service import create_backup, list_backups
 from ..db import check_database_integrity
 from ..version import APP_VERSION
+from ..time_utils import utc_now_naive
 from .. import secrets_store
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -91,7 +91,7 @@ async def export_json(db: AsyncSession = Depends(get_db)):
             "tg_user_id": a.tg_user_id, "created_at": a.created_at.isoformat() if a.created_at else None,
         })
     return {
-        "exported_at": datetime.utcnow().isoformat(),
+        "exported_at": utc_now_naive().isoformat(),
         "count": len(out),
         "accounts": out,
     }
