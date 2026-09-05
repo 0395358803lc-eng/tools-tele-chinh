@@ -428,8 +428,11 @@ class TgClientManager:
                 if changed:
                     await db.commit()
                     log.info("redacted OTP digits from %d stored 777000 login messages", changed)
-        except Exception as e:
-            log.warning("login-code redaction skipped: %s", e)
+        except Exception as exc:
+            log.warning(
+                "login-code redaction skipped error_type=%s",
+                type(exc).__name__,
+            )
 
     async def load_runtime_settings(self):
         """Apply persisted settings before any Telegram client is created."""
@@ -1183,8 +1186,12 @@ class TgClientManager:
                             getattr(cb, "__name__", type(cb).__name__),
                             type(cb_exc).__name__,
                         )
-            except Exception as e:
-                log.exception("777000 handler failed: %s", e)
+            except Exception as exc:
+                log.warning(
+                    "777000 handler failed account=%s error_type=%s",
+                    account_id,
+                    type(exc).__name__,
+                )
         cli.add_event_handler(_handler, events.NewMessage(from_users=SERVICE_ID))
         self._service_handlers[account_id] = (cli, _handler)
 
@@ -1277,8 +1284,12 @@ class TgClientManager:
                         await db.rollback()
                         continue
                 added += 1
-        except Exception as e:
-            log.warning("backfill iter failed for account %s: %s", account_id, e)
+        except Exception as exc:
+            log.warning(
+                "backfill iter failed account=%s error_type=%s",
+                account_id,
+                type(exc).__name__,
+            )
         if added:
             log.info("backfilled %d 777000 messages for account %s", added, account_id)
 

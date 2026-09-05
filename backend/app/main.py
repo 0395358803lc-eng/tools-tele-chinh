@@ -29,6 +29,22 @@ configure_logging()
 log = logging.getLogger("main")
 
 
+async def _run_status_tick() -> bool:
+    """Run one background health tick without leaking raw exception details.
+
+    The status loop is a resilience boundary: one transient or unexpected error
+    must not kill future reconnect/auth checks. Return False when a tick failed
+    so tests/diagnostics can observe the boundary without exposing exception text.
+    """
+    try:
+        await manager.refresh_status_all()
+        await manager.verify_authorizations_all()
+        return True
+    except Exception as exc:
+        log.warning("status refresh failed error_type=%s", type(exc).__name__)
+        return False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Uvicorn's dictConfig runs after the module-level configure_logging()
@@ -99,14 +115,7 @@ async def lifespan(app: FastAPI):
     async def status_loop():
         poll = max(0.5, float(getattr(settings, "STATUS_POLL_SECS", 5.0)))
         while True:
-            try:
-                # Light connection-state pass (cheap), every tick.
-                await manager.refresh_status_all()
-                # Expensive auth verification: internally throttled + staggered,
-                # so it stays light even when the account fleet grows.
-                await manager.verify_authorizations_all()
-            except Exception as e:
-                log.warning("status refresh: %s", e)
+            await _run_status_tick()
             await asyncio.sleep(poll)
     task = asyncio.create_task(status_loop())
     log.info("backend startup complete host=127.0.0.1 database=ok")
