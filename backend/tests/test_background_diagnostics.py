@@ -23,6 +23,10 @@ class _ReadSession:
         return _EmptyResult()
 
 
+class _ExpectedRpcError(Exception):
+    pass
+
+
 class _BrokenIteratorClient:
     def iter_messages(self, *_args, **_kwargs):
         return _BrokenAsyncIterator()
@@ -33,7 +37,7 @@ class _BrokenAsyncIterator:
         return self
 
     async def __anext__(self):
-        raise RuntimeError("sensitive-marker")
+        raise _ExpectedRpcError("sensitive-marker")
 
 
 class BackgroundDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
@@ -98,6 +102,7 @@ class BackgroundDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
     async def test_backfill_iterator_failure_is_contained_without_raw_error(self):
         manager = TgClientManager()
         with (
+            patch("app.tg_manager.RPCError", _ExpectedRpcError),
             patch("app.tg_manager.AsyncSessionLocal", return_value=_ReadSession()),
             self.assertLogs("tg_manager", level="WARNING") as captured,
         ):
@@ -108,8 +113,8 @@ class BackgroundDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             )
 
         joined = "\n".join(captured.output)
-        self.assertIn("backfill iter failed account=42", joined)
-        self.assertIn("RuntimeError", joined)
+        self.assertIn("backfill Telegram read stopped account=42", joined)
+        self.assertIn("_ExpectedRpcError", joined)
         self.assertNotIn("sensitive-marker", joined)
 
 

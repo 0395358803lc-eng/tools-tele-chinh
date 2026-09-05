@@ -1301,37 +1301,52 @@ class TgClientManager:
             seen = {row[0] for row in res.all()}
         added = 0
         try:
-            async for msg in cli.iter_messages(SERVICE_ID, limit=limit):
-                if msg.id in seen:
-                    continue
-                text = msg.message or ""
-                if not text:
-                    continue
-                m_type = classify_777000(text)
-                if m_type == "login_code":
-                    text = redact_login_code(text)
-                async with AsyncSessionLocal() as db:
-                    sm = SecurityMessage(
-                        account_id=account_id,
-                        tg_msg_id=msg.id,
-                        message_text=text,
-                        type=m_type,
-                        is_read=True,  # backfilled history: don't spam unread
-                        received_at=msg.date.replace(tzinfo=None) if msg.date else datetime.utcnow(),
-                    )
-                    db.add(sm)
-                    try:
-                        await db.commit()
-                    except IntegrityError:
-                        await db.rollback()
-                        continue
-                added += 1
-        except Exception as exc:
+            iterator = cli.iter_messages(SERVICE_ID, limit=limit).__aiter__()
+        except (RPCError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
             log.warning(
-                "backfill iter failed account=%s error_type=%s",
+                "backfill Telegram stream unavailable account=%s error_type=%s",
                 account_id,
                 type(exc).__name__,
             )
+            return
+
+        while True:
+            try:
+                msg = await iterator.__anext__()
+            except StopAsyncIteration:
+                break
+            except (RPCError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
+                log.warning(
+                    "backfill Telegram read stopped account=%s error_type=%s",
+                    account_id,
+                    type(exc).__name__,
+                )
+                break
+
+            if msg.id in seen:
+                continue
+            text = msg.message or ""
+            if not text:
+                continue
+            m_type = classify_777000(text)
+            if m_type == "login_code":
+                text = redact_login_code(text)
+            async with AsyncSessionLocal() as db:
+                sm = SecurityMessage(
+                    account_id=account_id,
+                    tg_msg_id=msg.id,
+                    message_text=text,
+                    type=m_type,
+                    is_read=True,  # backfilled history: don't spam unread
+                    received_at=msg.date.replace(tzinfo=None) if msg.date else datetime.utcnow(),
+                )
+                db.add(sm)
+                try:
+                    await db.commit()
+                except IntegrityError:
+                    await db.rollback()
+                    continue
+            added += 1
         if added:
             log.info("backfilled %d 777000 messages for account %s", added, account_id)
 
