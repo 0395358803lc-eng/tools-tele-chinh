@@ -5,8 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from telethon.tl.functions.account import (
     GetAuthorizationsRequest, ResetAuthorizationRequest, GetPasswordRequest,
 )
-from telethon.errors import FloodWaitError, PasswordHashInvalidError
+from telethon.errors import FloodWaitError, PasswordHashInvalidError, RPCError
 from datetime import datetime
+import logging
 
 from ..db import get_db, AsyncSessionLocal
 from ..models import SecurityMessage, Account
@@ -16,6 +17,7 @@ from .. import secrets_store
 from ..utils import bulk_stream, friendly_error, ok_result
 
 router = APIRouter(prefix="/api/security", tags=["security"])
+log = logging.getLogger("security")
 
 
 @router.get("/messages", response_model=list[SecurityMessageOut])
@@ -81,6 +83,25 @@ def _is_wrong_password(e: Exception) -> bool:
     return type(e).__name__ == "PasswordHashInvalidError"
 
 
+async def _save_2fa_after_remote_change(phone: str, password: str) -> bool:
+    """Persist a password after Telegram has already accepted the remote change.
+
+    This boundary is intentionally broad: once the remote mutation succeeds, a
+    local secure-store failure must not make the whole operation look failed,
+    because retrying could mutate the Telegram account again. We still emit a
+    diagnostic with error type only and return True to surface a warning result.
+    """
+    try:
+        await secrets_store.save_2fa(phone, password)
+        return False
+    except Exception as exc:
+        log.warning(
+            "2FA remote change succeeded but secure-store save failed error_type=%s",
+            type(exc).__name__,
+        )
+        return True
+
+
 @router.post("/bulk_2fa")
 async def bulk_2fa(body: Bulk2faIn, db: AsyncSession = Depends(get_db)):
     """Change (or set) the Two-Step password on many accounts at once.
@@ -111,22 +132,13 @@ async def bulk_2fa(body: Bulk2faIn, db: AsyncSession = Depends(get_db)):
                 acc.has_2fa = True
                 await s.commit()
 
-    async def _save_warn(phone: str):
-        """Persist the new password, but never let a save failure mask the fact
-        that Telegram already accepted the change. Returns a warning flag."""
-        try:
-            await secrets_store.save_2fa(phone, new_password)
-            return False
-        except Exception:
-            return True
-
     async def _change(cli, aid):
         phone = phone_by_id.get(aid, "")
         pw = await cli(GetPasswordRequest())
         # Account has no 2FA yet -> just set the new password (no current needed).
         if not pw.has_password:
             await cli.edit_2fa(new_password=new_password, hint=hint)
-            warn = await _save_warn(phone)
+            warn = await _save_2fa_after_remote_change(phone, new_password)
             await _set_has_2fa(aid)
             return ok_result("security.set2faSaveFailed" if warn else "security.set2fa")
 
@@ -148,7 +160,7 @@ async def bulk_2fa(body: Bulk2faIn, db: AsyncSession = Depends(get_db)):
             tried += 1
             try:
                 await cli.edit_2fa(current_password=cand, new_password=new_password, hint=hint)
-                warn = await _save_warn(phone)
+                warn = await _save_2fa_after_remote_change(phone, new_password)
                 await _set_has_2fa(aid)
                 key = "security.changed2faSaveFailed" if warn else "security.changed2fa"
                 return ok_result(key, {"tried": tried})
@@ -173,8 +185,14 @@ async def _terminate_other_authorizations(cli) -> tuple[int, int]:
         try:
             await cli(ResetAuthorizationRequest(hash=a.hash))
             killed += 1
-        except Exception:
+        except FloodWaitError:
+            raise
+        except RPCError as exc:
             failed += 1
+            log.warning(
+                "Telegram authorization reset failed error_type=%s",
+                type(exc).__name__,
+            )
     return killed, failed
 
 
