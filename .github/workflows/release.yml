@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+    branches:
+      - "release/v*"
   workflow_dispatch:
 
 permissions:
@@ -11,7 +13,7 @@ permissions:
 
 jobs:
   windows-release:
-    name: Build sanitized Windows release
+    name: Build Windows desktop release
     runs-on: windows-latest
 
     steps:
@@ -23,7 +25,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: backend/requirements.lock
+          cache-dependency-path: |
+            backend/requirements.lock
+            desktop/requirements-build.txt
 
       - name: Create backend virtual environment
         shell: pwsh
@@ -39,34 +43,83 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Build and validate release
+      - name: Install Inno Setup
         shell: pwsh
-        run: .\build_release.ps1
+        run: choco install innosetup --no-progress -y
 
-      - name: Locate release archive
-        id: archive
+      - name: Build Windows desktop artifacts
         shell: pwsh
-        run: |
-          $zip = Get-ChildItem -LiteralPath release -Filter "*.zip" | Select-Object -First 1
-          if (-not $zip) { throw "Release zip was not produced" }
-          "path=$($zip.FullName)" >> $env:GITHUB_OUTPUT
-          "name=$($zip.Name)" >> $env:GITHUB_OUTPUT
+        run: .\build_desktop.ps1
 
-      - name: Validate packaged release
+      - name: Locate release artifacts
+        id: artifacts
         shell: pwsh
         run: |
-          .\validate_release.ps1 -ZipPath "${{ steps.archive.outputs.path }}" -PythonPath ".\backend\.venv\Scripts\python.exe"
+          $portable = Get-ChildItem -LiteralPath release-desktop -Filter "MultiTGManager-Portable-*-x64.exe" | Select-Object -First 1
+          $installer = Get-ChildItem -LiteralPath release-desktop -Filter "MultiTGManager-Setup-*-x64.exe" | Select-Object -First 1
+          $source = Get-ChildItem -LiteralPath release -Filter "multi-tg-manager-*.zip" | Select-Object -First 1
+          if (-not $portable) { throw "Portable desktop EXE was not produced" }
+          if (-not $installer) { throw "Installer desktop EXE was not produced" }
+          if (-not $source) { throw "Source release ZIP was not produced" }
+          "portable=$($portable.FullName)" >> $env:GITHUB_OUTPUT
+          "installer=$($installer.FullName)" >> $env:GITHUB_OUTPUT
+          "source=$($source.FullName)" >> $env:GITHUB_OUTPUT
 
-      - name: Upload workflow artifact
+      - name: Smoke portable desktop executable
+        shell: pwsh
+        run: |
+          $runtime = Join-Path $env:RUNNER_TEMP "mtm-release-desktop-smoke"
+          if (Test-Path -LiteralPath $runtime) {
+            Remove-Item -LiteralPath $runtime -Recurse -Force
+          }
+          $env:MTM_RUNTIME_ROOT = $runtime
+          $process = Start-Process -FilePath "${{ steps.artifacts.outputs.portable }}" -ArgumentList "--smoke-test" -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Portable desktop smoke failed with exit code $($process.ExitCode)"
+          }
+
+      - name: Validate source release
+        shell: pwsh
+        run: |
+          .\validate_release.ps1 -ZipPath "${{ steps.artifacts.outputs.source }}" -PythonPath ".\backend\.venv\Scripts\python.exe"
+
+      - name: Resolve release tag
+        id: meta
+        shell: pwsh
+        run: |
+          $versionText = Get-Content ".\backend\app\version.py" -Raw
+          $version = ([regex]::Match($versionText, 'APP_VERSION\s*=\s*"([^"]+)"')).Groups[1].Value
+          if (-not $version) { throw "Could not read APP_VERSION" }
+          $expected = "v$version"
+          $tag = ""
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+          } elseif ("${{ github.ref_name }}" -like "release/v*") {
+            $tag = "${{ github.ref_name }}".Substring(8)
+          }
+          if ($tag -and $tag -ne $expected) {
+            throw "Release ref $tag does not match APP_VERSION $expected"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "publish=$([string]([bool]$tag).ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Upload Windows desktop artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.archive.outputs.name }}
-          path: ${{ steps.archive.outputs.path }}
+          name: windows-desktop-x64
+          path: |
+            ${{ steps.artifacts.outputs.portable }}
+            ${{ steps.artifacts.outputs.installer }}
+            ${{ steps.artifacts.outputs.source }}
           if-no-files-found: error
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: steps.meta.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.archive.outputs.path }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            release-desktop/*.exe
+            release/*.zip
           generate_release_notes: true
