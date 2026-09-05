@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import json
+import logging
 import os
 import re
 from ctypes import wintypes
@@ -29,6 +30,7 @@ from pathlib import Path
 
 from .config import PROJECT_ROOT, settings
 
+log = logging.getLogger("secrets_store")
 _lock = asyncio.Lock()
 
 # ---------------------------------------------------------------------------
@@ -247,10 +249,15 @@ async def migrate_legacy():
             # Upgrade path for users who already migrated data/secrets/twofa.json
             # with an older build but still have the duplicated backend copy.
             _remove_legacy_plaintext_if_covered(existing)
-    except Exception:
+    except Exception as exc:
         # Leave every plaintext source in place on any ambiguity/failure. Data
         # retention is safer than deleting the user's only usable 2FA password.
-        pass
+        # The broad containment is intentional at this migration boundary, but
+        # never silent: operators need to know migration was deferred.
+        log.warning(
+            "legacy 2FA migration deferred error_type=%s",
+            type(exc).__name__,
+        )
 
 
 async def save_2fa(phone: str, password: str):
