@@ -18,6 +18,7 @@ from .config import settings
 from .account_scheduler import AccountActionScheduler
 from .account_health import AccountHealthService
 from .client_cleanup import TelegramClientCleanup
+from .client_start import ClientStartService
 from .session_files import SessionFileStore
 from .session_folder_sync import SessionFolderSyncService
 from .phone_login import PhoneLoginService
@@ -150,6 +151,35 @@ class TgClientManager:
                 reset_reconnect=reset_reconnect,
             ),
             stop_client=lambda account_id: self.stop_client(account_id),
+            logger=log,
+        )
+        self._client_start = ClientStartService(
+            clients=self._clients,
+            manual_disconnect=self._manual_disconnect,
+            reconnect_exhausted=self._reconnect_exhausted,
+            client_factory=lambda *args, **kwargs: TelegramClient(*args, **kwargs),
+            account_lock=lambda account_id: self._acc_lock(account_id),
+            session_path_for_account=lambda acc: self._session_path_for_account(acc),
+            reset_reconnect=lambda account_id: self._reset_reconnect(account_id),
+            safe_disconnect=lambda client, **kwargs: self._safe_disconnect(
+                client,
+                **kwargs,
+            ),
+            record_connection_failure=lambda account_id, exc: self._record_connection_failure(
+                account_id,
+                exc,
+            ),
+            set_status=lambda account_id, status: self._set_status(account_id, status),
+            attach_listener=lambda account_id, client: self._attach_listener(
+                account_id,
+                client,
+            ),
+            sync_profile=lambda account_id, me: self._sync_profile(account_id, me),
+            backfill_security=lambda account_id, client, **kwargs: self._backfill_777000(
+                account_id,
+                client,
+                **kwargs,
+            ),
             logger=log,
         )
 
@@ -518,83 +548,16 @@ class TgClientManager:
         async with self.get_action_lock(acc.id):
             return await self._start_client_locked(acc, reset_reconnect=reset_reconnect)
 
-    async def _start_client_locked(self, acc: Account, *, reset_reconnect: bool) -> TelegramClient:
-        async with await self._acc_lock(acc.id):
-            if reset_reconnect:
-                self._reset_reconnect(acc.id)
-                self._manual_disconnect.discard(acc.id)
-            cli = self._clients.get(acc.id)
-            if cli and cli.is_connected():
-                await self._set_status(acc.id, "connected")
-                return cli
-            if cli is None:
-                cli = TelegramClient(
-                    self._session_path_for_account(acc),
-                    settings.tg_api_id,
-                    settings.TG_API_HASH,
-                    auto_reconnect=False,
-                )
-            try:
-                await asyncio.wait_for(
-                    cli.connect(), timeout=float(settings.TELEGRAM_CONNECT_TIMEOUT)
-                )
-                authorized = await asyncio.wait_for(
-                    cli.is_user_authorized(), timeout=float(settings.TELEGRAM_AUTH_TIMEOUT)
-                )
-            except asyncio.CancelledError:
-                await self._safe_disconnect(
-                    cli,
-                    context=f"start_client_cancelled:{acc.id}",
-                )
-                self._clients.pop(acc.id, None)
-                raise
-            except Exception as exc:
-                await self._safe_disconnect(
-                    cli,
-                    context=f"start_client_failed:{acc.id}",
-                )
-                self._clients.pop(acc.id, None)
-                await self._record_connection_failure(acc.id, exc)
-                raise
-            if not authorized:
-                await self._safe_disconnect(
-                    cli,
-                    context=f"start_client_unauthorized:{acc.id}",
-                )
-                self._clients.pop(acc.id, None)
-                self._reconnect_exhausted.add(acc.id)
-                await self._set_status(acc.id, "session_revoked")
-                raise RuntimeError("Session is not authorized")
-            self._clients[acc.id] = cli
-            self._attach_listener(acc.id, cli)
-            self._reset_reconnect(acc.id)
-            await self._set_status(acc.id, "connected")
-            # Sync profile best-effort for Telegram/network failures. Database or
-            # programming errors are intentionally not swallowed.
-            try:
-                me = await asyncio.wait_for(
-                    cli.get_me(), timeout=float(settings.TELEGRAM_AUTH_TIMEOUT)
-                )
-            except (RPCError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
-                log.warning(
-                    "account=%s profile refresh skipped error=%s",
-                    acc.id,
-                    type(exc).__name__,
-                )
-            else:
-                await self._sync_profile(acc.id, me)
-            # backfill recent 777000 messages we may have missed while offline
-            try:
-                await asyncio.wait_for(
-                    self._backfill_777000(acc.id, cli, limit=50), timeout=30
-                )
-            except Exception as exc:
-                log.warning(
-                    "startup backfill failed account=%s error_type=%s",
-                    acc.id,
-                    type(exc).__name__,
-                )
-            return cli
+    async def _start_client_locked(
+        self,
+        acc: Account,
+        *,
+        reset_reconnect: bool,
+    ) -> TelegramClient:
+        return await self._client_start.start_locked(
+            acc,
+            reset_reconnect=reset_reconnect,
+        )
 
     async def stop_client(self, account_id: int):
         # Never disconnect a session while one of its mutations is in flight.
